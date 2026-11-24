@@ -1,0 +1,31 @@
+# RetouchTools AI sidecar dependencies (Python 3.12, Windows x64)
+# All installed packages & selected default models use permissive / open-weight licenses
+# (MIT / Apache-2.0 / BSD-3-Clause / CreativeML OpenRAIL-M).
+# Heavy runtimes & downloaded model weights live isolated under %LOCALAPPDATA%\RetouchTools\.
+
+# === Primary ONNX / Parsing / LaMa Environment (%LOCALAPPDATA%\RetouchTools\venv) ===
+onnxruntime-gpu==1.32.0                  # MIT (CUDA 13 runtime + cuDNN)
+numpy==2.5.3                             # BSD-3-Clause
+opencv-contrib-python-headless==4.13.0.92 # Apache-2.0
+pillow==12.3.0                           # MIT-CMU
+scipy==1.18.1                            # BSD-3-Clause
+scikit-image==0.26.0                     # BSD-3-Clause
+requests==2.34.2                         # Apache-2.0
+tqdm==4.70.1                             # MPL-2.0 / MIT
+uniface==4.3.0                           # MIT (RetinaFace + 2d_106 + BiSeNet + PP-Matting V2)
+mediapipe==1.2.3                         # Apache-2.0 (selfie_multiclass_256x256.tflite 6-class body parsing)
+torch==2.15.0+cpu                        # BSD-3-Clause (ROI-cropped big-lama.pt)
+
+# === Isolated PyTorch CUDA 12.4 Generative Environment (%LOCALAPPDATA%\RetouchTools\venv-gen) ===
+# torch==2.6.0+cu124                     # BSD-3-Clause (CUDA 12.4)
+# torchvision==0.21.0+cu124              # BSD-3-Clause
+# diffusers / transformers / accelerate / safetensors / peft / einops / omegaconf (Apache-2.0)
+
+# === Local Models & External GPU Binaries ===
+# - xinntao/Real-ESRGAN-ncnn-vulkan v0.2.5.0 (MIT, Vulkan GPU)
+# - uniface RetinaFace / 2d106 / BiSeNet / PP-Matting V2 (MIT / Apache-2.0)
+# - onnx-community/BiRefNet_lite-ONNX (MIT, CUDA ONNX)
+# - Google MediaPipe selfie_multiclass_256x256.tflite (Apache-2.0)
+# - LaMa big-lama.pt (Apache-2.0)
+# - lllyasviel/IC-Light iclight_sd15_fc & iclight_sd15_fbc + realistic-vision-v51 (Apache-2.0 / OpenRAIL-M)
+# - gsdf/Counterfeit-V3.0 fp16 + lllyasviel/ControlNet-v1-1 Tile (OpenRAIL-M / Apache-2.0)

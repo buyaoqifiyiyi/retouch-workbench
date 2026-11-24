@@ -1,0 +1,55 @@
+# Python & Virtual Environments
+.venv/
+venv/
+venv-gen/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+build/
+dist/
+
+# Local Configs & Overrides
+.env
+config.env
+/AGENTS.local.md
+
+# Local Downloaded Weights, Wheels & External Binaries
+models/
+wheels/
+*.onnx
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.tflite
+*.gguf
+*.whl
+*.zip
+*.tar.gz
+*.msi
+*.exe
+*.dll
+
+# Layered Editing Projects, Raw Assets & Output Previews
+*.pcraft
+*.psd
+*.psb
+*.tif
+*.tiff
+*.raw
+*.arw
+*.cr2
+*.cr3
+*.nef
+*.dng
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.bmp
+*.mp4
+*.mp3
+.lightcraft-library/
+NVIDIA Corporation/
