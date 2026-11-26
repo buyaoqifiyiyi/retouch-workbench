@@ -25,7 +25,7 @@ torch==2.15.0+cpu                        # BSD-3-Clause (ROI-cropped big-lama.pt
 # - xinntao/Real-ESRGAN-ncnn-vulkan v0.2.5.0 (MIT, Vulkan GPU)
 # - uniface RetinaFace / 2d106 / BiSeNet / PP-Matting V2 (MIT / Apache-2.0)
 # - onnx-community/BiRefNet_lite-ONNX (MIT, CUDA ONNX)
-# - Google MediaPipe selfie_multiclass_256x256.tflite (Apache-2.0)
+# - Google MediaPipe selfie_multiclass_256x256.tflite / face_landmarker.task / pose_landmarker_heavy.task (Apache-2.0)
 # - LaMa big-lama.pt (Apache-2.0)
 # - lllyasviel/IC-Light iclight_sd15_fc & iclight_sd15_fbc + realistic-vision-v51 (Apache-2.0 / OpenRAIL-M)
 # - gsdf/Counterfeit-V3.0 fp16 + lllyasviel/ControlNet-v1-1 Tile (OpenRAIL-M / Apache-2.0)

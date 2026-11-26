@@ -92,6 +92,26 @@ ASSETS: list[dict] = [
     },
     {
         "phase": "core",
+        "name": "mediapipe/face_landmarker.task",
+        "dest": MODELS / "mediapipe" / "face_landmarker.task",
+        "urls": [
+            "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task",
+            "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+        ],
+        "min_bytes": 2_000_000,
+    },
+    {
+        "phase": "core",
+        "name": "mediapipe/pose_landmarker_heavy.task",
+        "dest": MODELS / "mediapipe" / "pose_landmarker_heavy.task",
+        "urls": [
+            "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task",
+            "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task",
+        ],
+        "min_bytes": 20_000_000,
+    },
+    {
+        "phase": "core",
         "name": "lama/big-lama.pt",
         "dest": MODELS / "lama" / "big-lama.pt",
         "urls": [
@@ -138,6 +158,17 @@ ASSETS: list[dict] = [
             "https://huggingface.co/JeremySD99/PhotoBlaze-PIH/resolve/main/gain.onnx",
         ],
         "min_bytes": 250_000_000,
+    },
+    {
+        "phase": "core",
+        "name": "depth/depth_anything_v2_small.onnx",
+        "dest": MODELS / "depth" / "depth_anything_v2_small.onnx",
+        "urls": [
+            "https://hf-mirror.com/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx",
+            "https://modelscope.cn/models/onnx-community/depth-anything-v2-small/resolve/master/onnx/model.onnx",
+            "https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/main/onnx/model.onnx",
+        ],
+        "min_bytes": 90_000_000,
     },
     # === Wheels phase: PyTorch CUDA 12.4 for isolated venv-gen ===
     {

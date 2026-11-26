@@ -512,7 +512,12 @@ def _retouch_garment_region(
     if mat == "auto":
         l_med = float(np.median(L[sel]))
         c_med = float(np.median(np.hypot(a[sel], b[sel])))
-        mat = "dark-twill" if (l_med < 50.0 or (l_med < 64.0 and c_med < 16.0)) else "light-cotton"
+        if l_med >= 58.0:
+            mat = "pastel-lace"
+        elif l_med < 50.0 or (l_med < 58.0 and c_med < 16.0):
+            mat = "dark-twill"
+        else:
+            mat = "light-cotton"
     is_dark = mat in ("dark-matte", "dark-twill", "glossy-leather")
     s_dehaze = float(0.78 if is_dark else 0.0) if spatial_dehaze < 0.0 else float(np.clip(spatial_dehaze, 0.0, 1.0))
     s_neut = float(0.78 if is_dark else 0.0) if neutral_black < 0.0 else float(np.clip(neutral_black, 0.0, 1.0))
@@ -604,6 +609,25 @@ def _retouch_garment_region(
         L_low_out = np.where(L_low_c < 36.0, np.maximum(5.0, L_low_c * 0.85), L_low_c)
         L_mid_out = L_mid * (1.0 + 0.40 * dc)
         L_hi_out = L_hi * (wp + 0.06)
+    elif mat == "pastel-lace":
+        # Recover sunlit lace embroidery crispness & soft pastel fold roll-off without darkening
+        L_low_out = np.where(L_low > 82.0, 82.0 + (L_low - 82.0) * 0.48, L_low)
+        L_mid_out = L_mid * (1.0 + 0.38 * dc)
+        L_hi_out = L_hi * min(1.45, wp + 0.18)
+    elif mat == "translucent-organza":
+        L_low_out = np.where(L_low > 85.0, 85.0 + (L_low - 85.0) * 0.55, L_low)
+        L_mid_out = L_mid * (1.0 + 0.28 * dc)
+        L_hi_out = L_hi * min(1.35, wp + 0.12)
+    elif mat == "satin-ribbon":
+        # Smooth noisy mottling while crisping satin highlight crests
+        L_low_sm = cv2.bilateralFilter(L_low.astype(np.float32), 7, 5.0, 10.0)
+        L_low_out = 0.65 * L_low + 0.35 * L_low_sm
+        L_mid_out = L_mid * (1.0 + 0.24 * dc)
+        L_hi_out = L_hi * wp
+    elif mat == "knit-stocking":
+        L_low_out = np.where(L_low > 86.0, 86.0 + (L_low - 86.0) * 0.58, L_low)
+        L_mid_out = L_mid * (1.0 + 0.34 * dc)
+        L_hi_out = L_hi * min(1.42, wp + 0.16)
     else:
         # light-cotton
         L_low_out = np.where(L_low > 86.0, 86.0 + (L_low - 86.0) * 0.65, L_low)
@@ -745,8 +769,8 @@ def run_garment_retouch(
         shoes_p = bp / "mask_shoes.png"
         if legs_p.exists():
             lm = read_gray_f32(legs_p, (h, w))
-            # Low-chroma darker textile inside legs (also catches pale glare strip along dark knee-sock shin while excluding warm peach knees)
-            raw_socks = (lm > 0.40) & (L0 < 78.0) & (np.hypot(a0, b0) < 13.0) & (b0 < 9.5) & (a0 < 4.0)
+            # Dark knee-socks vs bright white knit stockings (never confuse white stockings with black socks)
+            raw_socks = (lm > 0.40) & (L0 < 52.0) & (np.hypot(a0, b0) < 13.0) & (b0 < 9.5) & (a0 < 4.0)
             sock_clean = cv2.morphologyEx(raw_socks.astype(np.uint8), cv2.MORPH_OPEN, ell_kernel(2))
             sock_clean = cv2.morphologyEx(sock_clean, cv2.MORPH_CLOSE, ell_kernel(3))
             sock_m = guided_filter_gray(np.clip(L0 / 100.0, 0.0, 1.0), sock_clean.astype(np.float32), radius=8, eps=5e-4) * lm
@@ -802,7 +826,7 @@ def run_garment_retouch(
         res_dark = (
             (a_eff > 0.50) & (skin_m < 0.35) & (hair_m_bp < 0.35) & (up_m_bp < 0.30)
             & (d_lower <= 95.0) & (d_hair > 50.0)
-            & (combined_mask < 0.40) & (L0 < 96.0) & (np.hypot(a0, b0) < 14.0)
+            & (combined_mask < 0.40) & (L0 < 48.0) & (np.hypot(a0, b0) < 14.0)
             & (~((L0 > 54.0) & (a0 > 4.2)))
         )
         res_close = cv2.morphologyEx(res_dark.astype(np.uint8), cv2.MORPH_CLOSE, ell_kernel(7))

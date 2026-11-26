@@ -90,3 +90,17 @@
 - `sat_mean` 落在 `14%–26%`，`luma_mean` 落在 `128–152`（高透版）；
 - 背光侧皮肤亮度 `<= 受光石板地亮度 - 18`；
 - 主体 `lapVar` 与背景 `lapVar` 比值回落至合理光学景深差（眼部保持高锐、外缘与衣面柔合），皮肤 `Lab b*` 保持温和奶油区间（`7.5–13.0`）。
+
+---
+
+## 六、38 张商业 COS 成片实证基准与 `relight-sculpt` / `cinema-grade` 落地标准
+
+通过抽样统计 38 张高质感电影感 COS 合成正片的 `CIE Lab` 与光影结构，确立以下强制标准：
+1. **黑位与动态范围红线（拒当泛白灰雾图 + 实景前景框景）**：
+   - 全片最暗 2% 黑位目标 **`p02_L <= 22`**（参考图高调实测可达 `8–18`），动态跨度 **`p98_L - p02_L >= 62`**（优秀电影级通常在 **`70–85`**），泛白高光区（`L* > 85`）严格控制在 **`<= 22%`**（越靠近 **`12%`** 越有电影通透质感）；
+   - **禁止**对亮场背景全程叠加高浓度全屏灰白 `Screen` 雾气/泛光，也不得只靠微弱平面黑角蒙版交差：必须用 **`cinema-grade --mode bg-anchor`** 只保住光束与焦点亮区、主动压暗背光柱廊，同时配合 **`fg-vfx-3d`** 渲染大光圈真实前景暗框道具（如铁艺、花叶、暖金折光点）把人物物理夹入景深层次中。
+2. **2.5D 物理体积重打光与因果光照联动（`relight-sculpt` + `fg-vfx-3d`，零人物 AI 重绘）**：
+   - 使用 Apache-2.0 `Depth-Anything-V2-Small` 对人物前景做紧贴裁剪单目深度与表面法线估计，按场景主光方向导出 `Multiply` 体积暗部、`Screen` 迎光面提亮、`Screen` 菲涅耳轮廓包裹与 `Soft Light` 地面反光 4 张剪贴层；同步配合主拱门逆光轮廓光（`subject_arch_backrim_screen`）与贴身光带近距因果反射光（`vfx_wrap_causal_spill_screen`）；
+   - 在保护眼神与内面通透感的同时压实背光侧颧骨/下颌/手臂/裙褶暗部，与场景光影真正长在同一盏灯下。
+3. **PhotoCraft 原生电影调色收束（`cinema-grade --mode grade`）**：
+   - 使用 `layer.newAdjustmentLayer.colorLookup`（`interpolation: "tetrahedral"` 加载 `resources/luts/*.cube` 33³ 标准电影 3D LUT）+ `filter.cameraRaw` 三轮校色 + `colorBalance` 统一把人物与背景阴影收入同组冷青/暖金电影色调；高光微光晕（`Screen`）必须**仅从锚定建筑亮部（`L > 0.88`）单独提取**，严禁把前景粒子雾斑喂进光晕层。

@@ -42,13 +42,16 @@
 
 ## 4. `formal`：角色正片 8 步流程（严格两阶段门禁）
 
-1. **建立视觉目标**：对照角色与风格参考，确定主光方向、明暗主次、主色与视觉焦点；若需转厚涂方向，先确定是否允许明显塑形与重绘。
-2. **阶段一 · 自然美颜底图精修与服饰/下肢分频预处理（硬门禁，必须先出图并独立 `1:1` 验收）**：按 [液化指南](liquify-guide.md) 与 [自然奶油肌精修指南](natural-beauty-guide.md) 先完成暖润显影 → 骨相液化（照镜子检查）→ 液化后重跑蒙版 → 瑕疵/超分黑线及**跨眼眶杂乱发丝清理**（**严禁在抠图前用 `LaMa` 抹除衣物边缘飘带或发体夹缝杂物，防糊斑被锁进前景抠图**）→ 额头校准高低频与 D&B → 3 步奶油瓷白肌统一全身皮肤 → 自然眼唇与 **`garment-retouch --out-dark-mask`**（按 [服饰精修指南](garment-retouch-guide.md) 仅在 CIE Lab 明度 `L*` 去雾并锁死织纹、做半透明羽化去白边，同时导出含鞋袜与兜底深色鞋的完整深色服装罩）+ **`skin-unify`**（对齐手臂晴光肤色、清腿缘白边并叠黑裙/交叠腿遮挡影）→ 产出独立可交付的 `01_beauty_base.png` + `.pcraft`。
-3. **透视、光向与高分辨率场景底片准备（`linear_ratio >= 0.6`）**：严格按 [合成与溶图指南](compositing-guide.md) 先核对视平线、焦段畸变与主光方向；严禁把低清 `<=1K` 生图盲目 `realesrgan 4x` 当成 4K 背景使用，必须走 `tile-split` → 分块高清精绘 → `tile-stitch`（低频锁光影）跨过 `0.6` 原生分辨率门禁。
-4. **建立蒙版、按画风合发/画发与 PIH 人景溶图**：以 `retouch-ai.py matte --model birefnet-lite` + 默认 `SegFormer-B2 Clothes` 18 类 `body-parse` 精准拆分头发与服装/皮肤，按实际画风调用 `hair-comp`（实拍风默认 `real-first --groom` 保留原生 4K 连续发丝、顺发流轻理顺炸毛并回暖漂白发白斑，同时零间隙避让手臂；需要飘逸毛流感时按 [分层画发丝指南](hair-painting-guide.md) 运行 `retouch-ai.py hair-paint` 输出**主体后景层 `02b_HAIR_PAINT_BEHIND_4K` + 主体前景层 `03b_HAIR_PAINT_FRONT_4K`** 的极细单丝束可开关图层组），随后执行 **`retouch-ai.py harmonize --garment-dark-mask <out-dark-mask>`（PhotoBlaze-PIH ONNX CUDA + 完整黑衣鞋袜防回灰保护 + 双半径 Light Wrap + 颗粒匹配）** 输出非破坏图层。
-5. **三要素复核与物理光影补全**：在顶部建临时 `CHECK LAYERS` 诊断组，按主光方向补三层阴影（`multiply` 接触影 → AO → `fieldBlur` 近实远虚方向影）、反曲线扫受光面与局部地面反光（**环境 `Screen` 反弹光须排除已压暗的下肢膝盖阴影区**）；仅在需要二次元厚涂时才按 [厚涂方法卡](painterly-methods.md) 整合。
-6. **空间景深、前后遮挡特效与溢光**：使用 `lensBlur`/`tiltShift` 对齐前中后景物理景深与空气雾；发光/水雾/粒子分“主体后/主体前”两层穿插，用 `blendingOptions.fillOpacity` 控制 `linearDodge` 光晕不过曝，并在手/衣/脸补足邻近溢光染色。
-7. **胶水收束、全项掩码体检与独立 `1:1` 审图验收**：关闭 `CHECK LAYERS` 诊断组，加统一传感器颗粒层；导出前先跑 **`retouch-ai.py mask-audit`**（零破洞、零半透明残影、遮挡不断发、黑衣不偏棕、织纹保留、人景溶合度、原生分辨率门禁），并确认由视觉模型**亲眼审阅**全部热点与 `<=512px` 独立 `1:1` 切片（未看图仅算 `NUMERIC_PASS_VISUAL_UNVERIFIED`，严禁冒称最终通过），最后转 sRGB 保存终稿 `.pcraft` / `.psd` / `.png`。
+1. **建立视觉目标与协同边界（零人物 AI 重绘）**：对照角色与风格参考确定主光方向与视觉重心。**硬性边界：人物主体（肤色、五官、妆面、发丝、服饰）全程纯 PC 软件手修/手绘（`skin-fs` / `makeup-paint` / `body-liquify` / `garment-retouch` / `hair-paint`），严禁对人物调用 AI 重绘**；外部 AI 抽卡仅限背景空镜与 `#000000` 黑底粒子特效叠层。
+2. **阶段一 · 纯 PC 美颜与服饰底图精修（硬门禁，必须先出图并独立 `1:1` 验收）**：按 [液化指南](liquify-guide.md) 与 [自然奶油肌精修指南](natural-beauty-guide.md) 先完成 LightCraft 暖润显影 → **`body-liquify`**（33 骨骼与袜口曲率智能液化，照镜子核对）→ 液化后重跑蒙版 → **`skin-fs`**（Rolling-Guidance CIE Lab 三频锁毛孔 + 478 点原生 D&B 立体修容）→ **`makeup-paint`**（478 点 PhotoCraft 压感手绘睫毛/眼线/卧蚕珍珠/唇釉腮红）→ **`garment-retouch`**（浅色服饰选 `pastel-lace` / `translucent-organza` / `knit-stocking`；深色服饰 `--out-dark-mask`）→ **`skin-unify`** → 产出独立 `01_beauty_base.png` + `.pcraft`。
+3. **阶段二 · `scene-whitemodel` 白模建景 + 用户 AI 抽背景/黑底特效 + `cutout-refine` 完整发丝精抠**：用 `scene-whitemodel` 输出精准透视白模、16-bit Z 深度、`scene_meta.json` 与双语提示词交由用户抽卡；人物主抠图强制走 **`cutout-refine`**（1:1 边界分块 + 多层 `F/B` 光学前景色解算），彻底根治发丝啃食缺口与深紫/灰黑边缘溢色。
+4. **阶段三 · `bg-anchor` / `relight-sculpt` 体积光影重塑 + `fg-vfx-3d` 实景前景与因果光效 + 克制黑底特效**：
+   - 先运行 **`cinema-grade --mode bg-anchor`** 压暗背景非主光柱廊、保住主光源聚光聚焦并建立近景黑位；随后用 **`relight-sculpt`** 基于 `Depth-Anything-V2` 2.5D 法线产出 4 张纯非破坏 PhotoCraft 剪贴光影层，在不AI重绘人物的前提下把人物明暗体积感顺应主光方向拉开到 4:1–6:1；结合 `hair-comp --mode real-first --groom`、`hair-paint` 与 `harmonize` 对齐色温；
+   - 运行 **`fg-vfx-3d`** 用 Blender `f/1.18` 真实景深渲染大虚化前景暗框（如铁艺、水晶光斑、背光花叶把主体“夹”入空间并遮挡底部硬切），同步产出顺着姿态与道具“后穿前绕”的三维流光丝带及局部因果实光反射、拱门背光边缘光；
+   - 若融入用户抽卡的黑底（`#000000`）粒子/光斑，用 **`vfx-overlay --placement auto-split --density-gamma 1.65~2.0 --haze-suppress 0.65~0.80`** 做能量守恒 Unmult 拆层与雾斑抑制，确保背景建筑与人物始终稳居第一焦点、绝不翻白雾或喧宾夺主。
+5. **三要素复核与物理阴影补全**：在顶部建临时 `CHECK LAYERS` 诊断组，按主光方向补三层阴影（`multiply` 接触影 → AO → `fieldBlur` 近实远虚方向影），**环境 `Screen` 反弹光须排除已压暗的下肢膝盖阴影区**；仅在需要二次元厚涂时才按 [厚涂方法卡](painterly-methods.md) 整合。
+6. **电影级色彩收束、高亮微光晕与颗粒统一（`cinema-grade --mode grade`）**：使用 PhotoCraft 原生 `filter.cameraRaw`、`layer.newAdjustmentLayer.colorLookup`（`interpolation: "tetrahedral"` 加载 `resources/luts/*.cube` 33³ 标准 `.cube` 3D LUT）与 `colorBalance` 统一把人物和场景锁定同一冷暖电影影调；高光光晕严格只从场景真实亮源提取，绝不把大面积粒子云喂进光晕层；最顶层加统一单色传感器颗粒（`Soft Light` `addNoise`）。
+7. **胶水收束、`cinema_tone_check` 体检与独立 `1:1` 审图验收**：关闭 `CHECK LAYERS` 诊断组；导出前必跑 **`retouch-ai.py mask-audit`**（零破洞、零残影、遮挡不断发、暗衣不偏棕、光感区分服饰明暗梯度、全片 `cinema_tone_check` 核查黑位 `p02_L` 与动态跨度、原生分辨率门禁），并由视觉模型**亲眼审阅**全部热点与 `<=512px` 独立 `1:1` 切片后方可使用 `--visual-reviewed` 取得 `PASS`，最后转 sRGB 保存终稿 `.pcraft` / `.psd` / `.png`。
 
 ## 5. 常见失败与排查表
 
@@ -65,6 +68,10 @@
 | 手绘飘发像扁平色带、铁丝线或扫过眼颊 | 多簇笔尖在小间距下熔成平带、弧向脱离原发下落重力、未按起笔局部自吸发色或人脸避让过小；改用 `hair_03_single_strand` 极细聚簇单丝束 + 局部自吸混色 + 扩张 `face_guard`，并拆成主体后景/前景双组。 |
 | 主体轮廓旁出现大片灰白糊斑 | 在 `BiRefNet` 抠图前用 `LaMa` 抹除了飘带或发体夹缝杂物；改用原图直抠或在换背景后于独立层清理，并与原片对照核验。 |
 | 加了特效仍显空洞 | 特效缺乏明确光源、空间遮挡与邻近受光反射；回到主光与主体关系重整明暗。 |
+| 特效星尘糊成刺眼白雾/抢走主体与道具风头 | 前后景非能量守恒双重/三重硬叠（`Screen`+`Add`）且把特效云喂进光晕层；改用能量守恒 `vfx-overlay --density-gamma 1.7~2.0 --haze-suppress 0.65~0.80`，撤掉重复 `Add` 层，并由 `fg-vfx-3d` 接手“后穿前绕”主特效与局部实光反射。 |
+| 只加了调色滤镜但人物仍像“大号立绘贴在全景壁纸上” | 背景过亮发雾（`p02_L > 38`）、缺少立体冷暖体积暗面、且仅靠边缘暗角代替真实前景遮挡物；执行 `bg-anchor` + `relight-sculpt` 拉开 4:1 反差，并用 `fg-vfx-3d` 渲染大光圈虚化前景铁艺/花叶实际咬合主体边缘。 |
+| 细发丝被抠出锯齿断口、发丝边带灰紫晕色 | 低分缩略图粗抠或硬削边缘；改走 `cutout-refine`（1:1 边界分块 + 连续色彩线 F/B 解算 + 零衰减近邻色采样）。 |
+| Blender 透明世界下前景玻璃折射出现“黑心圆环” | 透明世界对 `Glass BSDF` 内部全反射返回黑虚空；将前景晶滴改为 `LayerWeight` 驱动 `Transparent + 暖金微光` 混合着色器。 |
 | 发到手机/网页后偏色 | 未正确从工作色域转换到 sRGB 并嵌入配置，或仅用了“指定配置文件”。 |
 
 ## 6. 交付与状态表述纪律
