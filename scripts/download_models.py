@@ -61,6 +61,17 @@ ASSETS: list[dict] = [
     # === Core phase: parsing, matting, inpainting, upscaling & skin retouch ===
     {
         "phase": "core",
+        "name": "segformer/segformer_b2_clothes.onnx",
+        "dest": MODELS / "segformer" / "segformer_b2_clothes.onnx",
+        "urls": [
+            "https://hf-mirror.com/mattmdjaga/segformer_b2_clothes/resolve/main/onnx/model.onnx",
+            "https://hf-mirror.com/Xenova/segformer_b2_clothes/resolve/main/onnx/model.onnx",
+            "https://huggingface.co/mattmdjaga/segformer_b2_clothes/resolve/main/onnx/model.onnx",
+        ],
+        "min_bytes": 90_000_000,
+    },
+    {
+        "phase": "core",
         "name": "birefnet_lite.onnx",
         "dest": MODELS / "birefnet" / "birefnet_lite.onnx",
         "urls": [
@@ -108,6 +119,26 @@ ASSETS: list[dict] = [
         ],
         "min_bytes": 30_000_000,
     },
+    {
+        "phase": "core",
+        "name": "pih/curves.onnx",
+        "dest": MODELS / "pih" / "curves.onnx",
+        "urls": [
+            "https://hf-mirror.com/JeremySD99/PhotoBlaze-PIH/resolve/main/curves.onnx",
+            "https://huggingface.co/JeremySD99/PhotoBlaze-PIH/resolve/main/curves.onnx",
+        ],
+        "min_bytes": 80_000_000,
+    },
+    {
+        "phase": "core",
+        "name": "pih/gain.onnx",
+        "dest": MODELS / "pih" / "gain.onnx",
+        "urls": [
+            "https://hf-mirror.com/JeremySD99/PhotoBlaze-PIH/resolve/main/gain.onnx",
+            "https://huggingface.co/JeremySD99/PhotoBlaze-PIH/resolve/main/gain.onnx",
+        ],
+        "min_bytes": 250_000_000,
+    },
     # === Wheels phase: PyTorch CUDA 12.4 for isolated venv-gen ===
     {
         "phase": "wheels",
@@ -153,7 +184,7 @@ ASSETS: list[dict] = [
         "min_bytes": 1_000_000_000,
     },
     {
-        "phase": "gen",
+        "phase": "tile",
         "name": "controlnet-tile/config.json",
         "dest": MODELS / "controlnet-tile" / "config.json",
         "urls": [
@@ -164,7 +195,7 @@ ASSETS: list[dict] = [
         "min_bytes": 100,
     },
     {
-        "phase": "gen",
+        "phase": "tile",
         "name": "controlnet-tile/diffusion_pytorch_model.bin",
         "dest": MODELS / "controlnet-tile" / "diffusion_pytorch_model.bin",
         "urls": [
@@ -192,7 +223,7 @@ for rel, min_b in SKIN_RETOUCH_FILES:
 for rel, min_b in RV51_FILES:
     ASSETS.append(
         {
-            "phase": "gen",
+            "phase": "tile",
             "name": f"sd15-rv51/{rel}",
             "dest": MODELS / "sd15-rv51" / rel,
             "urls": [
@@ -224,10 +255,12 @@ def _select_assets(phase: str) -> list[dict]:
     if phase == "all":
         return ASSETS
     if phase == "models":
-        return [a for a in ASSETS if a["phase"] in {"core", "gen"}]
-    if phase in {"core", "wheels", "gen"}:
+        return [a for a in ASSETS if a["phase"] in {"core", "tile", "gen"}]
+    if phase == "gen":
+        return [a for a in ASSETS if a["phase"] in {"tile", "gen"}]
+    if phase in {"core", "wheels", "tile"}:
         return [a for a in ASSETS if a["phase"] == phase]
-    raise ValueError(f"Unknown phase: {phase!r}. Expected all|core|wheels|gen|models.")
+    raise ValueError(f"Unknown phase: {phase!r}. Expected all|core|wheels|tile|gen|models.")
 
 
 def _extract_archive_if_needed(zip_path: Path, target_dir: Path) -> None:
@@ -245,7 +278,7 @@ def main() -> int:
         "phase",
         nargs="?",
         default="all",
-        choices=["all", "core", "wheels", "gen", "models"],
+        choices=["all", "core", "wheels", "tile", "gen", "models"],
         help="Asset group to sync (default: all)",
     )
     parser.add_argument("--dry-run", "--list", dest="dry_run", action="store_true", help="Print manifest and destinations without downloading")

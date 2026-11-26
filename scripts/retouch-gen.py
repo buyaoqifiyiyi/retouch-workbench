@@ -490,6 +490,127 @@ def cmd_painterly(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_tile_refine(args: argparse.Namespace) -> int:
+    """Overlapping tiled ControlNet-Tile photographic detail refinement (6 GB VRAM safe)."""
+    import torch
+    from diffusers import (
+        ControlNetModel,
+        DPMSolverMultistepScheduler,
+        StableDiffusionControlNetImg2ImgPipeline,
+    )
+    from diffusers.models.attention_processor import AttnProcessor2_0
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU not available in venv-gen")
+    if not (RV51_DIR / "model_index.json").exists():
+        raise FileNotFoundError(f"Missing SD1.5 RV5.1 diffusers dir: {RV51_DIR}")
+    if not (CN_TILE_DIR / "config.json").exists():
+        raise FileNotFoundError(f"Missing ControlNet Tile dir: {CN_TILE_DIR}")
+
+    in_path = Path(args.input).resolve()
+    out_path = Path(args.out).resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_path.exists() and not args.overwrite:
+        raise FileExistsError(f"Output exists (use --overwrite): {out_path}")
+
+    orig_rgb = _read_rgb(in_path)
+    orig_w, orig_h = orig_rgb.size
+    orig_np = np.array(orig_rgb, dtype=np.float32)
+
+    dtype = torch.float16
+    controlnet = ControlNetModel.from_pretrained(str(CN_TILE_DIR), torch_dtype=dtype, local_files_only=True)
+    pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
+        str(RV51_DIR),
+        controlnet=controlnet,
+        torch_dtype=dtype,
+        safety_checker=None,
+        feature_extractor=None,
+        requires_safety_checker=False,
+        local_files_only=True,
+    )
+    pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+        pipe.scheduler.config,
+        algorithm_type="dpmsolver++",
+        use_karras_sigmas=True,
+    )
+    pipe.unet.set_attn_processor(AttnProcessor2_0())
+    pipe.controlnet.set_attn_processor(AttnProcessor2_0())
+    pipe.vae.set_attn_processor(AttnProcessor2_0())
+    pipe.vae.enable_slicing()
+    pipe.vae.enable_tiling()
+    pipe.enable_model_cpu_offload()
+
+    tile_sz = _align8(args.tile_size)
+    ov = int(args.overlap)
+    step = max(64, tile_sz - ov)
+    xs = [0] if orig_w <= tile_sz else sorted(set(list(range(0, max(1, orig_w - tile_sz + 1), step)) + [orig_w - tile_sz]))
+    ys = [0] if orig_h <= tile_sz else sorted(set(list(range(0, max(1, orig_h - tile_sz + 1), step)) + [orig_h - tile_sz]))
+
+    accum = np.zeros_like(orig_np)
+    w_sum = np.zeros((orig_h, orig_w), dtype=np.float32)
+    gen = torch.Generator(device="cuda").manual_seed(int(args.seed))
+
+    for idx_y, y0 in enumerate(ys):
+        for idx_x, x0 in enumerate(xs):
+            x1 = min(orig_w, x0 + tile_sz)
+            y1 = min(orig_h, y0 + tile_sz)
+            crop = orig_rgb.crop((x0, y0, x1, y1))
+            cw, ch = crop.size
+            rw, rh = _align8(cw), _align8(ch)
+            crop_fit = crop.resize((rw, rh), Image.Resampling.LANCZOS) if (rw, rh) != (cw, ch) else crop
+            res = pipe(
+                prompt=args.prompt,
+                negative_prompt=args.negative_prompt,
+                image=crop_fit,
+                control_image=crop_fit,
+                strength=float(args.denoise),
+                controlnet_conditioning_scale=float(args.control_scale),
+                guidance_scale=float(args.guidance),
+                num_inference_steps=int(args.steps),
+                generator=gen,
+            ).images[0]
+            if res.size != (cw, ch):
+                res = res.resize((cw, ch), Image.Resampling.LANCZOS)
+            wx = np.ones(cw, dtype=np.float32)
+            wy = np.ones(ch, dtype=np.float32)
+            if idx_x > 0 and ov > 2:
+                n = min(cw // 2, ov)
+                wx[:n] = np.linspace(0.0, 1.0, n, dtype=np.float32)
+            if idx_x < len(xs) - 1 and ov > 2:
+                n = min(cw // 2, ov)
+                wx[-n:] = np.linspace(1.0, 0.0, n, dtype=np.float32)
+            if idx_y > 0 and ov > 2:
+                n = min(ch // 2, ov)
+                wy[:n] = np.linspace(0.0, 1.0, n, dtype=np.float32)
+            if idx_y < len(ys) - 1 and ov > 2:
+                n = min(ch // 2, ov)
+                wy[-n:] = np.linspace(1.0, 0.0, n, dtype=np.float32)
+            wt = np.outer(wy, wx)
+            accum[y0:y1, x0:x1] += np.array(res, dtype=np.float32) * wt[:, :, None]
+            w_sum[y0:y1, x0:x1] += wt
+
+    out_np = np.clip(accum / np.maximum(w_sum[:, :, None], 1e-5), 0.0, 255.0).astype(np.uint8)
+    Image.fromarray(out_np, mode="RGB").save(out_path)
+    del pipe, controlnet
+    _clear_vram()
+
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "size": [orig_w, orig_h],
+                "tiles": len(xs) * len(ys),
+                "tile_size": tile_sz,
+                "denoise": float(args.denoise),
+                "out": str(out_path),
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="RetouchTools CUDA Generative Helper")
     sub = ap.add_subparsers(dest="command", required=True)
@@ -546,6 +667,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_pt.add_argument("--match-input-size", action="store_true")
     p_pt.add_argument("--overwrite", action="store_true")
     p_pt.set_defaults(func=cmd_painterly)
+
+    p_tr = sub.add_parser("tile-refine")
+    p_tr.add_argument("input")
+    p_tr.add_argument("--out", required=True)
+    p_tr.add_argument(
+        "--prompt",
+        default="masterpiece architectural photograph, crisp weathered natural limestone pores, delicate natural leaves and rose petals, realistic subtle mortar joints, sharp 85mm full-frame lens optical detail",
+    )
+    p_tr.add_argument(
+        "--negative-prompt",
+        default="oil painting, anime, illustration, CGI grid, heavy black outline, blurry, plastic, wax, distorted lines",
+    )
+    p_tr.add_argument("--denoise", type=float, default=0.30)
+    p_tr.add_argument("--control-scale", type=float, default=0.90)
+    p_tr.add_argument("--guidance", type=float, default=5.5)
+    p_tr.add_argument("--steps", type=int, default=20)
+    p_tr.add_argument("--tile-size", type=int, default=768)
+    p_tr.add_argument("--overlap", type=int, default=160)
+    p_tr.add_argument("--seed", type=int, default=42)
+    p_tr.add_argument("--overwrite", action="store_true")
+    p_tr.set_defaults(func=cmd_tile_refine)
 
     return ap
 

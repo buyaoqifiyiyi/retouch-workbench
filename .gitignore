@@ -47,6 +47,8 @@ wheels/
 *.jpg
 *.jpeg
 *.png
+!resources/brushes/
+!resources/brushes/*.png
 *.webp
 *.bmp
 *.mp4

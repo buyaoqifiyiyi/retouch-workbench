@@ -32,11 +32,20 @@ LAMA_MODEL = Path(os.environ.get("LAMA_MODEL_PATH", MODELS_ROOT / "lama" / "big-
 BIREFNET_LITE_MODEL = Path(
     os.environ.get("BIREFNET_LITE_MODEL", MODELS_ROOT / "birefnet" / "birefnet_lite.onnx")
 )
+SEGFORMER_CLOTHES_MODEL = Path(
+    os.environ.get("SEGFORMER_CLOTHES_MODEL", MODELS_ROOT / "segformer" / "segformer_b2_clothes.onnx")
+)
 SKIN_RETOUCH_DIR = Path(
     os.environ.get("SKIN_RETOUCH_DIR", MODELS_ROOT / "skin-retouching")
 )
 GFPGAN_MODEL = Path(
     os.environ.get("GFPGAN_ONNX_MODEL", MODELS_ROOT / "gfpgan" / "gfpgan_1.4.onnx")
+)
+PIH_CURVES_MODEL = Path(
+    os.environ.get("PIH_CURVES_MODEL", MODELS_ROOT / "pih" / "curves.onnx")
+)
+PIH_GAIN_MODEL = Path(
+    os.environ.get("PIH_GAIN_MODEL", MODELS_ROOT / "pih" / "gain.onnx")
 )
 GEN_VENV_PYTHON = Path(
     os.environ.get("RETOUCH_GEN_PYTHON", TOOLS_ROOT / "venv-gen" / "Scripts" / "python.exe")
@@ -300,11 +309,21 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
         },
         "lama_model": {"path": str(LAMA_MODEL), "exists": LAMA_MODEL.exists()},
         "birefnet_lite": {"path": str(BIREFNET_LITE_MODEL), "exists": BIREFNET_LITE_MODEL.exists()},
+        "segformer_clothes": {"path": str(SEGFORMER_CLOTHES_MODEL), "exists": SEGFORMER_CLOTHES_MODEL.exists()},
         "skin_retouch_model": {
             "path": str(SKIN_RETOUCH_DIR),
             "exists": (SKIN_RETOUCH_DIR / "pytorch_model.pt").exists() and (SKIN_RETOUCH_DIR / "model.onnx").exists(),
         },
         "gfpgan_v1_4": {"path": str(GFPGAN_MODEL), "exists": GFPGAN_MODEL.exists()},
+        "pih_curves": {"path": str(PIH_CURVES_MODEL), "exists": PIH_CURVES_MODEL.exists()},
+        "pih_gain": {"path": str(PIH_GAIN_MODEL), "exists": PIH_GAIN_MODEL.exists()},
+        "hair_brushes": {
+            "path": str(Path(__file__).resolve().parent.parent / "resources" / "brushes"),
+            "exists": all(
+                (Path(__file__).resolve().parent.parent / "resources" / "brushes" / fn).exists()
+                for fn in ("hair_01_multi_clump.png", "hair_02_fine_clump.png", "hair_03_single_strand.png")
+            ),
+        },
         "venv_gen_python": {"path": str(GEN_VENV_PYTHON), "exists": GEN_VENV_PYTHON.exists()},
     }
     gen_runtime: dict[str, Any] = {"available": False}
@@ -616,23 +635,64 @@ def cmd_matte(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_body_parse(args: argparse.Namespace) -> int:
+def _guided_filter_gray(guide_01: Any, src_01: Any, radius: int = 12, eps: float = 1e-3) -> Any:
     import cv2
-    import mediapipe as mp  # type: ignore
     import numpy as np
-    from mediapipe.tasks.python import BaseOptions  # type: ignore
-    from mediapipe.tasks.python.vision import (  # type: ignore
-        ImageSegmenter,
-        ImageSegmenterOptions,
-        RunningMode,
-    )
+
+    if radius <= 0:
+        return src_01
+    ksize = (2 * radius + 1, 2 * radius + 1)
+    mean_i = cv2.boxFilter(guide_01, cv2.CV_32F, ksize)
+    mean_p = cv2.boxFilter(src_01, cv2.CV_32F, ksize)
+    corr_i = cv2.boxFilter(guide_01 * guide_01, cv2.CV_32F, ksize)
+    corr_ip = cv2.boxFilter(guide_01 * src_01, cv2.CV_32F, ksize)
+    var_i = corr_i - mean_i * mean_i
+    cov_ip = corr_ip - mean_i * mean_p
+    a = cov_ip / (var_i + eps)
+    b = mean_p - a * mean_i
+    mean_a = cv2.boxFilter(a, cv2.CV_32F, ksize)
+    mean_b = cv2.boxFilter(b, cv2.CV_32F, ksize)
+    return np.clip(mean_a * guide_01 + mean_b, 0.0, 1.0)
+
+
+def _read_alpha_or_gray_f32(path: Path, expected_hw: tuple[int, int]) -> Any:
+    import cv2
+    import numpy as np
+
+    data = np.fromfile(str(path), dtype=np.uint8)
+    if data.size == 0:
+        raise FileNotFoundError(f"Empty or unreadable mask/alpha file: {path}")
+    arr = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
+    if arr is None:
+        raise ValueError(f"Failed to decode mask/alpha file: {path}")
+    if arr.ndim == 3 and arr.shape[2] == 4:
+        arr = arr[:, :, 3]
+    elif arr.ndim == 3:
+        arr = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
+    eh, ew = expected_hw
+    if arr.shape[:2] != (eh, ew):
+        arr = cv2.resize(arr, (ew, eh), interpolation=cv2.INTER_LINEAR)
+    return arr.astype(np.float32) / 255.0
+
+
+def _save_preview_rgb(path: Path, rgb_u8: Any, max_side: int = 1400, overwrite: bool = False) -> None:
+    import cv2
+
+    h, w = rgb_u8.shape[:2]
+    scale = min(1.0, float(max_side) / float(max(h, w)))
+    out_arr = cv2.resize(rgb_u8, (int(round(w * scale)), int(round(h * scale))), interpolation=cv2.INTER_AREA) if scale < 1.0 else rgb_u8
+    _write_png_u8(path, cv2.cvtColor(out_arr, cv2.COLOR_RGB2BGR), overwrite=overwrite)
+
+
+def cmd_body_parse(args: argparse.Namespace) -> int:
+    _ensure_cuda_dlls()
+    import cv2
+    import numpy as np
 
     in_path = Path(args.input).resolve()
     out_dir = Path(args.out_dir).resolve()
     if not in_path.exists():
         raise FileNotFoundError(f"Input image not found: {in_path}")
-    if not MEDIAPIPE_SELFIE_MODEL.exists():
-        raise FileNotFoundError(f"MediaPipe multiclass model not found: {MEDIAPIPE_SELFIE_MODEL}")
 
     img_bgr = _read_bgr(in_path)
     h, w = img_bgr.shape[:2]
@@ -642,60 +702,176 @@ def cmd_body_parse(args: argparse.Namespace) -> int:
     if args.refine_with_matte:
         refine_matte = _read_gray_f32(Path(args.refine_with_matte).resolve(), (h, w))
 
-    options = ImageSegmenterOptions(
-        base_options=BaseOptions(model_asset_path=str(MEDIAPIPE_SELFIE_MODEL)),
-        running_mode=RunningMode.IMAGE,
-        output_confidence_masks=True,
-        output_category_mask=False,
-    )
-    with ImageSegmenter.create_from_options(options) as segmenter:
-        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        res = segmenter.segment(mp_img)
+    backend_req = getattr(args, "backend", "auto")
+    if backend_req == "segformer" and not SEGFORMER_CLOTHES_MODEL.exists():
+        raise FileNotFoundError(f"SegFormer-B2 Clothes ONNX model missing: {SEGFORMER_CLOTHES_MODEL}. Run download_models.py core.")
 
-    if not res.confidence_masks or len(res.confidence_masks) < 6:
-        raise RuntimeError(f"Expected 6 multiclass confidence masks, got {len(res.confidence_masks or [])}")
+    use_segformer = backend_req == "segformer" or (backend_req == "auto" and SEGFORMER_CLOTHES_MODEL.exists())
+    backend_used = "segformer_b2_clothes" if use_segformer else "mediapipe_selfie_256"
+    provider_used = "unknown"
 
-    def _upscale_conf(idx: int) -> Any:
-        raw = res.confidence_masks[idx].numpy_view().copy()
-        if raw.ndim == 3:
-            raw = raw[:, :, 0]
-        if raw.shape != (h, w):
-            raw = cv2.resize(raw.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
-        return np.clip(raw, 0.0, 1.0)
+    if use_segformer:
+        import onnxruntime as ort  # type: ignore
 
-    # MediaPipe selfie_multiclass_256x256 classes: 0=bg, 1=hair, 2=body_skin, 3=face_skin, 4=clothes, 5=accessories
-    c_hair = _upscale_conf(1)
-    c_body_skin = _upscale_conf(2)
-    c_face_skin = _upscale_conf(3)
-    c_clothes = _upscale_conf(4)
-    c_accessories = _upscale_conf(5)
-    c_all_skin = np.clip(c_body_skin + c_face_skin, 0.0, 1.0)
+        avail = ort.get_available_providers()
+        providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in avail] or ["CPUExecutionProvider"]
+        sess = ort.InferenceSession(str(SEGFORMER_CLOTHES_MODEL), providers=providers)
+        provider_used = sess.get_providers()[0] if sess.get_providers() else "unknown"
+        inp_meta = sess.get_inputs()[0]
+        out_name = sess.get_outputs()[0].name
 
-    class_arrays = {
-        "mask_body_hair": c_hair,
-        "mask_body_skin": c_body_skin,
-        "mask_face_skin": c_face_skin,
-        "mask_all_skin": c_all_skin,
-        "mask_clothes": c_clothes,
-        "mask_accessories": c_accessories,
-    }
+        rgb_512 = cv2.resize(rgb, (512, 512), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        chw = np.transpose((rgb_512 - mean) / std, (2, 0, 1))[None, ...]
+        if "float16" in str(inp_meta.type):
+            chw = chw.astype(np.float16)
+
+        logits = np.asarray(sess.run([out_name], {inp_meta.name: chw})[0], dtype=np.float32)[0]
+        logits = logits - logits.max(axis=0, keepdims=True)
+        exp_l = np.exp(logits)
+        probs = exp_l / np.maximum(exp_l.sum(axis=0, keepdims=True), 1e-8)
+
+        guide_01 = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+        g_radius = int(getattr(args, "guided_radius", 12))
+
+        def _up(cls_indices: tuple[int, ...]) -> Any:
+            p_sum = probs[cls_indices[0]].copy()
+            for idx in cls_indices[1:]:
+                p_sum = p_sum + probs[idx]
+            p_sum = np.clip(p_sum, 0.0, 1.0)
+            up = cv2.resize(p_sum, (w, h), interpolation=cv2.INTER_LINEAR)
+            if g_radius > 0:
+                up = _guided_filter_gray(guide_01, up, radius=g_radius, eps=1e-3)
+            return np.clip(up, 0.0, 1.0)
+
+        m_hair = _up((2,))
+        m_upper = _up((4,))
+        m_skirt = _up((5,))
+        m_pants = _up((6,))
+        m_dress = _up((7,))
+        m_skirt_dress = _up((5, 7))
+        m_shoes = _up((9, 10))
+        m_face = _up((11,))
+        m_legs = _up((12, 13))
+        m_arms = _up((14, 15))
+        m_body_skin = _up((12, 13, 14, 15))
+        m_all_skin = _up((11, 12, 13, 14, 15))
+        m_clothes_all = _up((4, 5, 6, 7, 8))
+        m_accessories = _up((1, 3, 8, 16, 17))
+        m_protected_body = np.clip(np.maximum.reduce([m_clothes_all, m_shoes, m_all_skin]), 0.0, 1.0)
+
+        class_arrays = {
+            "mask_body_hair": m_hair,
+            "mask_body_skin": m_body_skin,
+            "mask_face_skin": m_face,
+            "mask_all_skin": m_all_skin,
+            "mask_clothes": m_clothes_all,
+            "mask_accessories": m_accessories,
+            "mask_hair": m_hair,
+            "mask_face": m_face,
+            "mask_upper_clothes": m_upper,
+            "mask_skirt": m_skirt,
+            "mask_pants": m_pants,
+            "mask_dress": m_dress,
+            "mask_skirt_dress": m_skirt_dress,
+            "mask_shoes": m_shoes,
+            "mask_legs": m_legs,
+            "mask_arms": m_arms,
+            "mask_clothes_all": m_clothes_all,
+            "mask_protected_body": m_protected_body,
+        }
+    else:
+        import mediapipe as mp  # type: ignore
+        from mediapipe.tasks.python import BaseOptions  # type: ignore
+        from mediapipe.tasks.python.vision import (  # type: ignore
+            ImageSegmenter,
+            ImageSegmenterOptions,
+            RunningMode,
+        )
+
+        if not MEDIAPIPE_SELFIE_MODEL.exists():
+            raise FileNotFoundError(f"MediaPipe multiclass model not found: {MEDIAPIPE_SELFIE_MODEL}")
+        options = ImageSegmenterOptions(
+            base_options=BaseOptions(model_asset_path=str(MEDIAPIPE_SELFIE_MODEL)),
+            running_mode=RunningMode.IMAGE,
+            output_confidence_masks=True,
+            output_category_mask=False,
+        )
+        with ImageSegmenter.create_from_options(options) as segmenter:
+            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            res = segmenter.segment(mp_img)
+        if not res.confidence_masks or len(res.confidence_masks) < 6:
+            raise RuntimeError(f"Expected 6 multiclass confidence masks, got {len(res.confidence_masks or [])}")
+        provider_used = "MediaPipeCPU"
+
+        def _upscale_conf(idx: int) -> Any:
+            raw = res.confidence_masks[idx].numpy_view().copy()
+            if raw.ndim == 3:
+                raw = raw[:, :, 0]
+            if raw.shape != (h, w):
+                raw = cv2.resize(raw.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+            return np.clip(raw, 0.0, 1.0)
+
+        c_hair = _upscale_conf(1)
+        c_body_skin = _upscale_conf(2)
+        c_face_skin = _upscale_conf(3)
+        c_clothes = _upscale_conf(4)
+        c_accessories = _upscale_conf(5)
+        c_all_skin = np.clip(c_body_skin + c_face_skin, 0.0, 1.0)
+        class_arrays = {
+            "mask_body_hair": c_hair,
+            "mask_body_skin": c_body_skin,
+            "mask_face_skin": c_face_skin,
+            "mask_all_skin": c_all_skin,
+            "mask_clothes": c_clothes,
+            "mask_accessories": c_accessories,
+            "mask_protected_body": np.clip(np.maximum(c_clothes, c_all_skin), 0.0, 1.0),
+        }
 
     out_dir.mkdir(parents=True, exist_ok=True)
     outputs: dict[str, str] = {}
     coverage_pct: dict[str, float] = {}
     total_px = float(w * h)
+    refined_arrays: dict[str, Any] = {}
     for name, arr in class_arrays.items():
         if refine_matte is not None:
             arr = arr * refine_matte
+        refined_arrays[name] = arr
         u8 = np.clip(np.round(arr * 255.0), 0, 255).astype(np.uint8)
         out_p = out_dir / f"{name}.png"
         _write_png_u8(out_p, u8, overwrite=args.overwrite)
         outputs[name] = str(out_p)
         coverage_pct[name] = round(100.0 * float((u8 >= 128).sum()) / total_px, 2)
 
+    # Color-coded diagnostic overlay so semantic boundaries can be visually verified immediately
+    overlay = rgb.astype(np.float32).copy()
+    palette = [
+        ("mask_body_hair", (255, 196, 40)),
+        ("mask_face_skin", (255, 120, 180)),
+        ("mask_body_skin", (255, 175, 130)),
+        ("mask_upper_clothes" if "mask_upper_clothes" in refined_arrays else "mask_clothes", (80, 210, 255)),
+        ("mask_skirt_dress" if "mask_skirt_dress" in refined_arrays else "mask_clothes", (165, 95, 255)),
+        ("mask_shoes" if "mask_shoes" in refined_arrays else "mask_accessories", (60, 235, 110)),
+    ]
+    blend_rgb = np.zeros_like(overlay)
+    blend_w = np.zeros((h, w), dtype=np.float32)
+    for key, col in palette:
+        if key not in refined_arrays:
+            continue
+        m = (refined_arrays[key] >= 0.45).astype(np.float32)
+        blend_rgb[m > 0] = np.array(col, dtype=np.float32)
+        blend_w = np.maximum(blend_w, m * 0.48)
+    overlay = np.clip(overlay * (1.0 - blend_w[:, :, None]) + blend_rgb * blend_w[:, :, None], 0.0, 255.0).astype(np.uint8)
+    overlay_p = out_dir / "preview_parse_overlay.png"
+    _save_preview_rgb(overlay_p, overlay, max_side=1400, overwrite=args.overwrite)
+    outputs["preview_parse_overlay"] = str(overlay_p)
+
     payload = {
         "ok": True,
         "input": str(in_path),
+        "backend": backend_used,
+        "provider": provider_used,
         "width": w,
         "height": h,
         "refined_with_matte": str(args.refine_with_matte) if args.refine_with_matte else None,
@@ -735,6 +911,9 @@ def cmd_upscale(args: argparse.Namespace) -> int:
     model_name = args.model
     native_scale = target_scale if model_name == "realesr-animevideov3" else 4
 
+    target_w, target_h = in_w * target_scale, in_h * target_scale
+    style = getattr(args, "style", "photo")
+
     with tempfile.TemporaryDirectory(prefix="retouch_up_") as tmpdir:
         tmp_dir = Path(tmpdir)
         tmp_in = tmp_dir / "in.png"
@@ -770,22 +949,35 @@ def cmd_upscale(args: argparse.Namespace) -> int:
         if up_img is None:
             raise RuntimeError("Failed to decode upscaled output PNG from realesrgan-ncnn-vulkan.")
 
-        target_w, target_h = in_w * target_scale, in_h * target_scale
         if (up_img.shape[1], up_img.shape[0]) != (target_w, target_h):
             up_img = cv2.resize(up_img, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
 
+        if style == "photo" and up_img.ndim == 3 and up_img.shape[2] >= 3:
+            # Tame GAN over-sharpened waxy/oil-paint ridges while keeping micro-contrast
+            rgb_f = up_img[:, :, :3].astype(np.float32)
+            blur = cv2.GaussianBlur(rgb_f, (0, 0), sigmaX=1.4)
+            detail = rgb_f - blur
+            clamped = blur + np.tanh(detail / 22.0) * 22.0
+            up_img[:, :, :3] = np.clip(np.round(rgb_f * 0.25 + clamped * 0.75), 0, 255).astype(np.uint8)
+
         _write_png_u8(out_path, up_img, overwrite=args.overwrite)
 
-    payload = {
+    payload: dict[str, Any] = {
         "ok": True,
         "input": str(in_path),
         "out": str(out_path),
         "model": model_name,
+        "style": style,
         "native_scale": native_scale,
         "target_scale": target_scale,
         "in_size": [in_w, in_h],
         "out_size": [target_w, target_h],
     }
+    if min(in_w, in_h) < 1024 and target_scale > 2:
+        payload["native_resolution_warning"] = (
+            "Input shorter side < 1024px with >2x GAN upscale can produce oil-paint texture; "
+            "prefer tile-split + high-res tile refinement + tile-stitch."
+        )
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0
 
@@ -1218,6 +1410,502 @@ def cmd_face_restore(args: argparse.Namespace) -> int:
     return 0
 
 
+def _top_peaks(score: Any, n: int, sigma: float, min_dist: int) -> list[tuple[float, int, int]]:
+    """Return up to n (value, x, y) peaks of a score map, suppressing neighbours within min_dist."""
+    import cv2
+
+    s = cv2.GaussianBlur(score.astype("float32"), (0, 0), sigma) if sigma > 0 else score.astype("float32").copy()
+    peaks: list[tuple[float, int, int]] = []
+    for _ in range(n):
+        _, v, _, loc = cv2.minMaxLoc(s)
+        if v <= 1e-6:
+            break
+        peaks.append((float(v), int(loc[0]), int(loc[1])))
+        cv2.circle(s, loc, int(min_dist), 0.0, -1)
+    return peaks
+
+
+def cmd_mask_audit(args: argparse.Namespace) -> int:
+    import cv2
+    import numpy as np
+
+    in_path = Path(args.input).resolve()
+    out_dir = Path(args.out_dir).resolve()
+    if not in_path.exists():
+        raise FileNotFoundError(f"Input image not found: {in_path}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    img_bgr = _read_bgr(in_path)
+    h, w = img_bgr.shape[:2]
+    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+
+    failures: list[str] = []
+    checks: dict[str, Any] = {}
+    outputs: dict[str, str] = {}
+
+    # 1. Zero Interior Hole Check (protected_body vs trim_mask)
+    if args.trim_mask:
+        trim = _read_gray_f32(Path(args.trim_mask).resolve(), (h, w))
+        prot = _read_gray_f32(Path(args.protected_mask).resolve(), (h, w)) if args.protected_mask else None
+        ov = rgb.copy()
+        trimmed = trim < 0.95
+        ov[trimmed] = ov[trimmed] * 0.45 + np.array([255.0, 40.0, 40.0]) * 0.55
+        hole_info: dict[str, Any] = {"trimmed_px": int(trimmed.sum())}
+        if prot is not None:
+            holes = (prot >= 0.75) & (trim < 0.95)
+            n_holes = int(holes.sum())
+            hole_info["protected_interior_holes_px"] = n_holes
+            if n_holes > 0:
+                ys, xs = np.where(holes)
+                bbox = [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
+                hole_info["hole_bbox_xyxy"] = bbox
+                ov[holes] = np.array([255.0, 255.0, 0.0])
+                failures.append(f"interior_holes_in_protected_body: {n_holes} px at {bbox}")
+
+            # 1b. Translucent ghost strips left in trim_mask outside protected body
+            near_solid = cv2.dilate((trim >= 0.88).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))) > 0
+            near_prot = cv2.dilate((prot >= 0.35).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))) > 0
+            raw_ghost = (prot < 0.35) & (trim > 0.08) & (trim < 0.88) & (~near_solid) & (~near_prot)
+            ghost_open = cv2.morphologyEx(raw_ghost.astype(np.uint8), cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+            nc_g, lbl_g, st_g, cen_g = cv2.connectedComponentsWithStats(ghost_open, connectivity=8)
+            ghost_patches = [i for i in range(1, nc_g) if int(st_g[i, cv2.CC_STAT_AREA]) >= 250]
+            ghost_px = int(sum(int(st_g[i, cv2.CC_STAT_AREA]) for i in ghost_patches))
+            hole_info["trim_ghost_patches"] = len(ghost_patches)
+            hole_info["trim_ghost_px"] = ghost_px
+            if ghost_patches:
+                ghost_mask = np.isin(lbl_g, ghost_patches)
+                ov[ghost_mask] = np.array([255.0, 140.0, 0.0])
+                biggest = max(ghost_patches, key=lambda i: int(st_g[i, cv2.CC_STAT_AREA]))
+                gx, gy = int(cen_g[biggest][0]), int(cen_g[biggest][1])
+                failures.append(
+                    f"trim_translucent_ghost_strip: {len(ghost_patches)} patches ({ghost_px} px, largest at ({gx},{gy}))"
+                )
+        out_trim = out_dir / "audit_trim_overlay.png"
+        _save_preview_rgb(out_trim, np.clip(ov, 0, 255).astype(np.uint8), max_side=1400, overwrite=args.overwrite)
+        outputs["audit_trim_overlay"] = str(out_trim)
+        checks["interior_hole_check"] = hole_info
+
+    # 2. Bangs/Eye Translucent Ghosting Check
+    if args.hair_alpha and args.eyes_brows_mask:
+        hair_a = _read_alpha_or_gray_f32(Path(args.hair_alpha).resolve(), (h, w))
+        eyes_m = _read_gray_f32(Path(args.eyes_brows_mask).resolve(), (h, w))
+        ys_e, xs_e = np.where(eyes_m >= 0.35)
+        if len(ys_e) > 0:
+            # Check eyes/brows + narrow 14px band right above brow line
+            k_up = np.zeros((29, 9), dtype=np.uint8)
+            k_up[:16, :] = 1
+            check_zone = cv2.dilate((eyes_m >= 0.35).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))) > 0
+            mid_alpha = check_zone & (hair_a > 0.12) & (hair_a < 0.88)
+            n_ghost = int(mid_alpha.sum())
+            pct_ghost = round(100.0 * float(n_ghost) / max(1.0, float(check_zone.sum())), 2)
+            checks["bangs_ghosting_check"] = {"zone_px": int(check_zone.sum()), "translucent_px": n_ghost, "translucent_pct": pct_ghost}
+            if n_ghost > 250 or pct_ghost > 4.0:
+                failures.append(f"bangs_eye_translucent_overlap: {n_ghost} px ({pct_ghost}%)")
+
+            pad = 200
+            y0, y1 = max(0, int(ys_e.min()) - pad), min(h, int(ys_e.max()) + pad)
+            x0, x1 = max(0, int(xs_e.min()) - pad), min(w, int(xs_e.max()) + pad)
+            crop_ov = rgb[y0:y1, x0:x1].copy()
+            seam_m = (hair_a[y0:y1, x0:x1] > 0.08) & (hair_a[y0:y1, x0:x1] < 0.92)
+            crop_ov[seam_m] = crop_ov[seam_m] * 0.35 + np.array([255.0, 0.0, 220.0]) * 0.65
+            out_seam = out_dir / "audit_hair_seam_overlay.png"
+            _save_preview_rgb(out_seam, np.clip(crop_ov, 0, 255).astype(np.uint8), max_side=1024, overwrite=args.overwrite)
+            outputs["audit_hair_seam_overlay"] = str(out_seam)
+
+    # 3. Garment Internal Tone-Jump Check
+    if args.garment_mask:
+        gar = _read_gray_f32(Path(args.garment_mask).resolve(), (h, w))
+        core = cv2.erode((gar >= 0.65).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))) > 0
+        ov_g = rgb.copy()
+        gar_hi = gar >= 0.50
+        ov_g[gar_hi] = ov_g[gar_hi] * 0.65 + np.array([0.0, 235.0, 255.0]) * 0.35
+        out_gar = out_dir / "audit_garment_overlay.png"
+        _save_preview_rgb(out_gar, np.clip(ov_g, 0, 255).astype(np.uint8), max_side=1400, overwrite=args.overwrite)
+        outputs["audit_garment_overlay"] = str(out_gar)
+
+        if int(core.sum()) >= 1000:
+            luma = 0.2126 * rgb[:, :, 0] + 0.7152 * rgb[:, :, 1] + 0.0722 * rgb[:, :, 2]
+            luma_sm = cv2.GaussianBlur(luma, (0, 0), sigmaX=12.0)
+            ys_g, _ = np.where(core)
+            y_min, y_max = int(ys_g.min()), int(ys_g.max())
+            band_means = []
+            for by in range(y_min, max(y_min + 1, y_max - 39), 20):
+                bm = core[by:by + 40, :]
+                if bm.sum() >= 300:
+                    band_means.append((by, float(luma_sm[by:by + 40, :][bm].mean())))
+            max_jump = 0.0
+            jump_y = None
+            for i in range(len(band_means)):
+                for j in range(i + 1, len(band_means)):
+                    if 20 <= band_means[j][0] - band_means[i][0] <= 65:
+                        d = abs(band_means[j][1] - band_means[i][1])
+                        if d > max_jump:
+                            max_jump = d
+                            jump_y = [band_means[i][0], band_means[j][0]]
+            p10 = float(np.percentile(luma_sm[core], 10))
+            p90 = float(np.percentile(luma_sm[core], 90))
+            checks["garment_tone_check"] = {
+                "interior_px": int(core.sum()),
+                "p10_luma": round(p10, 1),
+                "p90_luma": round(p90, 1),
+                "max_band_jump": round(max_jump, 1),
+                "max_jump_y_pair": jump_y,
+            }
+            if max_jump > 38.0:
+                failures.append(f"garment_internal_tone_jump: {max_jump:.1f} luma across y={jump_y}")
+
+            # 3b. Neutral dark-garment chroma-cast check in CIE Lab (catches RGB dehaze brown-cast)
+            lab_gar = cv2.cvtColor(np.clip(rgb / 255.0, 0.0, 1.0).astype(np.float32), cv2.COLOR_RGB2LAB)
+            L_gar, a_gar, b_gar = lab_gar[:, :, 0], lab_gar[:, :, 1], lab_gar[:, :, 2]
+            dark_core = core & (L_gar < 45.0)
+            if int(dark_core.sum()) >= 500:
+                mean_a = float(a_gar[dark_core].mean())
+                mean_b = float(b_gar[dark_core].mean())
+                mean_c = float(np.hypot(mean_a, mean_b))
+                cast_rec: dict[str, Any] = {
+                    "dark_core_px": int(dark_core.sum()),
+                    "mean_a": round(mean_a, 2),
+                    "mean_b": round(mean_b, 2),
+                    "mean_chroma": round(mean_c, 2),
+                }
+                cast_failed = False
+                if getattr(args, "neutral_garment", False) and (abs(mean_a) > 5.0 or abs(mean_b) > 7.5 or mean_c > 8.5):
+                    cast_failed = True
+                    failures.append(
+                        f"garment_color_cast: dark core mean Lab (a*={mean_a:+.2f}, b*={mean_b:+.2f}, C*={mean_c:.2f}) exceeds neutral limits"
+                    )
+                if args.reference:
+                    ref_rgb_f = cv2.cvtColor(_read_bgr(Path(args.reference).resolve()), cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+                    lab_ref_g = cv2.cvtColor(ref_rgb_f, cv2.COLOR_RGB2LAB)
+                    ref_dark = core & (lab_ref_g[:, :, 0] < 55.0)
+                    if int(ref_dark.sum()) >= 500:
+                        ref_a = float(lab_ref_g[:, :, 1][ref_dark].mean())
+                        ref_b = float(lab_ref_g[:, :, 2][ref_dark].mean())
+                        ref_c = float(np.hypot(ref_a, ref_b))
+                        delta_c = float(np.hypot(mean_a - ref_a, mean_b - ref_b))
+                        cast_rec.update({"ref_a": round(ref_a, 2), "ref_b": round(ref_b, 2), "ref_chroma": round(ref_c, 2), "delta_chroma_vs_ref": round(delta_c, 2)})
+                        if not cast_failed and ref_c < 8.0 and delta_c > 5.5:
+                            failures.append(
+                                f"garment_color_cast: shifted from neutral reference (C*_ref={ref_c:.2f}) by dC*={delta_c:.2f} (> 5.5)"
+                            )
+                checks["garment_color_cast_check"] = cast_rec
+
+    # 5. Extended invariants: asset resolution, hair continuity/texture, subject-background blend, garment texture
+    def _k(r: int) -> Any:
+        return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+
+    def _mean(arr: Any, m: Any) -> float:
+        return float(arr[m].mean()) if m.any() else 0.0
+
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    fine = np.abs(gray - cv2.GaussianBlur(gray, (0, 0), 0.7))
+    ref_gray = ref_fine = ref_L = None
+    if args.reference:
+        ref_bgr = _read_bgr(Path(args.reference).resolve())
+        if ref_bgr.shape[:2] != (h, w):
+            raise ValueError(f"--reference must match input size {w}x{h}, got {ref_bgr.shape[1]}x{ref_bgr.shape[0]}")
+        ref_gray = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        ref_fine = np.abs(ref_gray - cv2.GaussianBlur(ref_gray, (0, 0), 0.7))
+        ref_L = cv2.cvtColor(ref_bgr, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32) * (100.0 / 255.0)
+    hotspots: list[tuple[str, float, int, int]] = []
+
+    # 5a. Native-resolution gate for generated/placed sources (upscaled AI plates invent oil-paint texture)
+    if args.asset:
+        from PIL import Image
+
+        res_rows = []
+        for spec in args.asset:
+            if "=" not in spec:
+                raise ValueError(f"Invalid --asset '{spec}'; expected NAME=PATH[|x,y,w,h]")
+            aname, rest = spec.split("=", 1)
+            apath, _, abox = rest.partition("|")
+            with Image.open(Path(apath).resolve()) as im_a:
+                aw, ah = im_a.size
+            bw, bh = (_parse_crop_spec(abox)[2:] if abox else (w, h))
+            lin = round(min(aw / max(1, bw), ah / max(1, bh)), 3)
+            res_rows.append({"name": aname, "native": [aw, ah], "mapped_to": [bw, bh], "linear_ratio": lin})
+            if lin < 0.6:
+                failures.append(f"asset_low_native_resolution: {aname} {aw}x{ah} mapped onto {bw}x{bh} (ratio {lin} < 0.6; detail is upscaler-invented)")
+        checks["asset_resolution_check"] = res_rows
+
+    def _check_hair_texture(target_hm: Any) -> float | None:
+        if ref_fine is None or not args.reference_hair_mask:
+            return None
+        rcore = cv2.erode((_read_gray_f32(Path(args.reference_hair_mask).resolve(), (h, w)) > 0.5).astype(np.uint8), _k(3)) > 0
+        core = cv2.erode(target_hm, _k(3)) > 0
+        if core.sum() < 2000 or rcore.sum() < 2000:
+            return None
+        tex = _mean(fine, core) / max(1e-3, _mean(ref_fine, rcore))
+        style_mode = getattr(args, "style", "photo")
+        hi_tex = 1.20 if style_mode == "photo" else 1.40
+        lo_tex = 0.65 if style_mode == "photo" else 0.55
+        if tex > hi_tex:
+            failures.append(f"hair_over_textured: fine detail {tex:.2f}x reference (> {hi_tex}, upscaler oil-paint look)")
+        elif tex < lo_tex:
+            failures.append(f"hair_plastic_smooth: fine detail {tex:.2f}x reference (< {lo_tex})")
+        return round(tex, 2)
+
+    # 5b. Hair continuity over replaced/composited hair cutouts + texture vs reference
+    # In real-first mode (--native-hair-mask without --hair-alpha), inspect native 4K hair texture
+    # and treat any --hair-layer overlays as decorative hair-paint wisps (safety-checked for eye overlap).
+    is_real_first_audit = bool(getattr(args, "native_hair_mask", None)) and not bool(args.hair_alpha)
+    hair_paths = ([args.hair_alpha] if args.hair_alpha else []) + ([] if is_real_first_audit else list(args.hair_layer or []))
+    hair_union = None
+    if hair_paths:
+        hair_union = np.maximum.reduce([_read_alpha_or_gray_f32(Path(p).resolve(), (h, w)) for p in hair_paths])
+        hm = (hair_union > 0.5).astype(np.uint8)
+        hair_px = int(hm.sum())
+        if hair_px >= 2000:
+            mpx = hair_px / 1e6
+            n_c, _, st_c, cen_c = cv2.connectedComponentsWithStats(hm, connectivity=8)
+            isl = [i for i in range(1, n_c) if 8 <= st_c[i, cv2.CC_STAT_AREA] < 400]
+            gap = ((cv2.morphologyEx(hm, cv2.MORPH_CLOSE, _k(4)) > 0) & (hm == 0)).astype(np.uint8)
+            n_g, _, st_g, cen_g = cv2.connectedComponentsWithStats(gap, connectivity=8)
+            gaps = [i for i in range(1, n_g) if st_g[i, cv2.CC_STAT_AREA] >= 6]
+            hair_info: dict[str, Any] = {
+                "hair_px": hair_px,
+                "layers": len(hair_paths),
+                "components": n_c - 1,
+                "islands_per_mpx": round(len(isl) / mpx, 1),
+                "gaps_per_mpx": round(len(gaps) / mpx, 1),
+            }
+            if len(gaps) / mpx > 30.0:
+                failures.append(f"hair_broken_gaps: {len(gaps)} sub-9px gaps ({len(gaps) / mpx:.0f}/Mpx > 30)")
+            if len(isl) / mpx > 15.0:
+                failures.append(f"hair_detached_islands: {len(isl)} fragments ({len(isl) / mpx:.0f}/Mpx > 15)")
+            heat = np.zeros((h, w), np.float32)
+            for i in gaps:
+                heat[int(cen_g[i][1]), int(cen_g[i][0])] += 1.0
+            for i in isl:
+                heat[int(cen_c[i][1]), int(cen_c[i][0])] += 1.0
+            hotspots += [("hair_break", v, x, y) for v, x, y in _top_peaks(heat, 3, 40.0, 260)]
+            tex_val = _check_hair_texture(hm)
+            if tex_val is not None:
+                hair_info["fine_texture_vs_reference"] = tex_val
+
+            # 5b-2. Occlusion-boundary hair chop / wide mid-alpha halo / gap-shelf check
+            if args.occluder_mask or args.protected_mask:
+                occ_path = Path(args.occluder_mask or args.protected_mask).resolve()
+                occ = (_read_gray_f32(occ_path, (h, w)) >= 0.5).astype(np.uint8)
+                dist_occ = cv2.distanceTransform(1 - occ, cv2.DIST_L2, 5)
+                halo = (occ == 0) & (dist_occ <= 18.0) & (hair_union > 0.08) & (hair_union < 0.85)
+                halo_open = cv2.morphologyEx(halo.astype(np.uint8), cv2.MORPH_OPEN, _k(2))
+                nh_o, lbl_o, st_o, cen_o = cv2.connectedComponentsWithStats(halo_open, connectivity=8)
+                halo_ids = [
+                    i for i in range(1, nh_o)
+                    if int(st_o[i, cv2.CC_STAT_AREA]) >= 250 and float(dist_occ[lbl_o == i].min()) <= 12.0
+                ]
+                halo_px = int(sum(int(st_o[i, cv2.CC_STAT_AREA]) for i in halo_ids))
+
+                gy_d, gx_d = np.gradient(dist_occ)
+                mag_d = np.hypot(gx_d, gy_d) + 1e-6
+                ux, uy = gx_d / mag_d, gy_d / mag_d
+                yy_idx, xx_idx = np.mgrid[0:h, 0:w]
+                ys_o14 = np.clip(np.round(yy_idx + 14.0 * uy).astype(np.int32), 0, h - 1)
+                xs_o14 = np.clip(np.round(xx_idx + 14.0 * ux).astype(np.int32), 0, w - 1)
+                ys_i18 = np.clip(np.round(yy_idx - 18.0 * uy).astype(np.int32), 0, h - 1)
+                xs_i18 = np.clip(np.round(xx_idx - 18.0 * ux).astype(np.int32), 0, w - 1)
+                shelf_gap = (
+                    (occ == 0) & (dist_occ >= 2.0) & (dist_occ <= 10.0) & (hair_union < 0.22)
+                    & (hair_union[ys_o14, xs_o14] > 0.60) & (hair_union[ys_i18, xs_i18] > 0.35)
+                )
+                shelf_open = cv2.morphologyEx(shelf_gap.astype(np.uint8), cv2.MORPH_OPEN, _k(1))
+                ns_o, lbl_s, st_s, cen_s = cv2.connectedComponentsWithStats(shelf_open, connectivity=8)
+                shelf_ids = [i for i in range(1, ns_o) if int(st_s[i, cv2.CC_STAT_AREA]) >= 200]
+                shelf_px = int(sum(int(st_s[i, cv2.CC_STAT_AREA]) for i in shelf_ids))
+
+                hair_info["occlusion_halo_patches"] = len(halo_ids)
+                hair_info["occlusion_halo_px"] = halo_px
+                hair_info["occlusion_gap_shelf_px"] = shelf_px
+                if halo_ids or shelf_ids:
+                    occ_score = np.where(np.isin(lbl_o, halo_ids) | np.isin(lbl_s, shelf_ids), 1.0, 0.0).astype(np.float32)
+                    hotspots += [("hair_occ", v, x, y) for v, x, y in _top_peaks(occ_score, 3, 24.0, 220)]
+                    failures.append(
+                        f"hair_occlusion_chop_or_ghost: {len(halo_ids)} halo bands ({halo_px} px), {len(shelf_ids)} gap shelves ({shelf_px} px)"
+                    )
+            checks["hair_continuity_check"] = hair_info
+    elif getattr(args, "native_hair_mask", None):
+        nh_m = (_read_gray_f32(Path(args.native_hair_mask).resolve(), (h, w)) > 0.5).astype(np.uint8)
+        tex_val = _check_hair_texture(nh_m)
+        ht_info: dict[str, Any] = {"mode": "real-first", "hair_px": int(nh_m.sum())}
+        if tex_val is not None:
+            ht_info["fine_texture_vs_reference"] = tex_val
+        checks["hair_texture_check"] = ht_info
+        if args.hair_layer:
+            hp_union = np.maximum.reduce([_read_alpha_or_gray_f32(Path(p).resolve(), (h, w)) for p in args.hair_layer])
+            hp_info: dict[str, Any] = {
+                "layers": len(args.hair_layer),
+                "painted_px": int((hp_union > 0.05).sum()),
+            }
+            if args.eyes_brows_mask:
+                eyes_m_hp = _read_gray_f32(Path(args.eyes_brows_mask).resolve(), (h, w))
+                eye_ov_px = int(((hp_union > 0.05) & (eyes_m_hp >= 0.25)).sum())
+                hp_info["eye_overlap_px"] = eye_ov_px
+                if eye_ov_px > 20:
+                    failures.append(f"hair_paint_eye_overlap: {eye_ov_px} px of painted hair overlap eyes/brows (> 20)")
+            checks["hair_paint_safety_check"] = hp_info
+
+    # 5c. Subject-background blend (edge warmth, light direction, grain)
+    if args.subject_alpha:
+        sa = _read_alpha_or_gray_f32(Path(args.subject_alpha).resolve(), (h, w))
+        sub, bgm = sa > 0.95, sa < 0.02
+        if sub.sum() >= 5000 and bgm.sum() >= 5000:
+            lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+            L = lab[:, :, 0] * (100.0 / 255.0)
+            Bc = lab[:, :, 2] - 128.0
+            soft = (sa > 0.02).astype(np.uint8)
+            inner = sub & ~(cv2.erode(sub.astype(np.uint8), _k(12)) > 0)
+            outer = bgm & (cv2.dilate(soft, _k(12)) > 0)
+            near = bgm & (cv2.dilate(soft, _k(120)) > 0)
+            left = np.arange(w)[None, :] < int(np.median(np.where(sub)[1]))
+            edge_db = _mean(Bc, inner) - _mean(Bc, outer)
+            subj_lr = _mean(L, sub & left) - _mean(L, sub & ~left)
+            bg_lr = _mean(L, near & left) - _mean(L, near & ~left)
+            blend_info: dict[str, Any] = {
+                "edge_warmth_db": round(edge_db, 1),
+                "subject_left_minus_right_L": round(subj_lr, 1),
+                "background_left_minus_right_L": round(bg_lr, 1),
+                "light_direction_mismatch": round(abs(subj_lr - bg_lr), 1),
+            }
+            if ref_L is not None:
+                ref_subj_lr = _mean(ref_L, sub & left) - _mean(ref_L, sub & ~left)
+                blend_info["reference_subject_left_minus_right_L"] = round(ref_subj_lr, 1)
+            else:
+                ref_subj_lr = None
+            blend_warnings: list[str] = []
+            # Thin-edge b* mixes skin/fabric/hair with background; record only (control image false-positived here).
+            if abs(edge_db) > 5.0:
+                blend_warnings.append(f"blend_edge_color_cast: subject edge b* differs from adjacent background by {edge_db:+.1f} (> 5, info)")
+            if abs(subj_lr - bg_lr) > 8.0:
+                msg = f"blend_light_direction_mismatch: subject L/R {subj_lr:+.1f} vs background {bg_lr:+.1f} (diff > 8)"
+                if ref_subj_lr is not None and abs(ref_subj_lr) > 8.0:
+                    blend_warnings.append(f"{msg}; albedo-driven in reference ({ref_subj_lr:+.1f}), info")
+                else:
+                    failures.append(msg)
+            # Segmented neutral-shadow cast: 6 vertical bands, subject rim (0-30px) vs background ring (0-60px),
+            # only neutral darks (L<40, chroma<14) so skin/garment colour does not count as cast.
+            Cc = np.hypot(lab[:, :, 1] - 128.0, Bc)
+            in_s = (sa > 0.9) & ~(cv2.erode((sa > 0.9).astype(np.uint8), _k(30)) > 0)
+            out_s = bgm & (cv2.dilate(soft, _k(60)) > 0)
+            ndark = (L < 40) & (Cc < 14)
+            sys_ = np.where(sa > 0.5)[0]
+            sy0, sy1 = int(sys_.min()), int(sys_.max())
+            step = (sy1 - sy0) / 6.0
+            YYi = np.arange(h)[:, None]
+            segs: list[dict[str, Any]] = []
+            for i in range(6):
+                band = (YYi >= sy0 + i * step) & (YYi < sy0 + (i + 1) * step)
+                mi, mo = in_s & band & ndark, out_s & band & ndark
+                rec: dict[str, Any] = {"segment": i, "y": [int(sy0 + i * step), int(sy0 + (i + 1) * step)], "n_subject": int(mi.sum()), "n_background": int(mo.sum())}
+                if mi.sum() < 2000 or mo.sum() < 2000:
+                    rec["skipped"] = True
+                else:
+                    gap = _mean(Bc, mi) - _mean(Bc, mo)
+                    rec["gap_b"] = round(gap, 1)
+                    if abs(gap) > 9.0:
+                        failures.append(f"blend_shadow_cast_segment: band {i} y{rec['y'][0]}-{rec['y'][1]} neutral-shadow b* gap {gap:+.1f} (> 9)")
+                    elif abs(gap) > 5.0:
+                        blend_warnings.append(f"blend_shadow_cast_segment: band {i} y{rec['y'][0]}-{rec['y'][1]} neutral-shadow b* gap {gap:+.1f} (5-9, style-dependent)")
+                segs.append(rec)
+            blend_info["shadow_cast_segments"] = segs
+            core6 = cv2.erode(sub.astype(np.uint8), _k(6)) > 0
+            ring = bgm & (cv2.dilate(soft, _k(250)) > 0)
+            for nm_, lo_, hi_ in (("shadow", 3.0, 35.0), ("highlight", 75.0, 97.0)):
+                ms_ = core6 & (L >= lo_) & (L <= hi_) & (Cc < 14)
+                mb_ = ring & (L >= lo_) & (L <= hi_) & (Cc < 14)
+                if ms_.sum() >= 5000 and mb_.sum() >= 5000:
+                    blend_info[f"{nm_}_cast_global_gap_b"] = round(_mean(Bc, ms_) - _mean(Bc, mb_), 1)
+            blend_info["warnings"] = blend_warnings
+            lap = cv2.GaussianBlur(np.abs(cv2.Laplacian(gray, cv2.CV_32F)), (0, 0), 4.0)
+            hf = np.abs(gray - cv2.GaussianBlur(gray, (0, 0), 1.0))
+            core = cv2.erode(sub.astype(np.uint8), _k(20)) > 0
+            bgc = cv2.erode(bgm.astype(np.uint8), _k(20)) > 0
+            if core.sum() >= 1000 and bgc.sum() >= 1000:
+                f_core = core & (lap < np.percentile(lap[core], 30))
+                f_bg = bgc & (lap < np.percentile(lap[bgc], 30))
+                grain = _mean(hf, f_core) / max(1e-3, _mean(hf, f_bg))
+                blend_info["grain_ratio_subject_over_bg"] = round(grain, 2)
+                if not 0.7 <= grain <= 1.5:
+                    failures.append(f"blend_grain_mismatch: subject/background grain ratio {grain:.2f} (outside 0.7-1.5)")
+            cnts, _ = cv2.findContours((sa > 0.5).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            if cnts:
+                seg = np.zeros((h, w), np.float32)
+                for x, y in max(cnts, key=len)[:, 0, :][::60]:
+                    s = np.s_[max(0, y - 40):y + 40, max(0, x - 40):x + 40]
+                    if inner[s].sum() >= 50 and outer[s].sum() >= 50:
+                        seg[y, x] = abs(_mean(Bc[s], inner[s]) - _mean(Bc[s], outer[s])) + 0.25 * abs(_mean(L[s], inner[s]) - _mean(L[s], outer[s]))
+                hotspots += [("blend_edge", v, x, y) for v, x, y in _top_peaks(seg, 3, 0.0, 260)]
+            checks["blend_check"] = blend_info
+
+    # 5d. Garment fabric texture retention vs reference
+    if args.garment_mask and ref_fine is not None:
+        gmask = _read_gray_f32(Path(args.garment_mask).resolve(), (h, w)) >= 0.5
+        if hair_union is not None:
+            gmask &= hair_union < 0.3
+        gmask = cv2.erode(gmask.astype(np.uint8), _k(6)) > 0
+        if gmask.sum() >= 5000:
+            mid = np.abs(cv2.GaussianBlur(gray, (0, 0), 1.5) - cv2.GaussianBlur(gray, (0, 0), 6.0))
+            rmid = np.abs(cv2.GaussianBlur(ref_gray, (0, 0), 1.5) - cv2.GaussianBlur(ref_gray, (0, 0), 6.0))
+            fine_ret = _mean(fine, gmask) / max(1e-3, _mean(ref_fine, gmask))
+            retention = (_mean(fine, gmask) / max(1e-3, _mean(mid, gmask))) / max(1e-3, _mean(ref_fine, gmask) / max(1e-3, _mean(rmid, gmask)))
+            checks["garment_texture_check"] = {"fine_vs_reference": round(fine_ret, 2), "texture_to_structure_retention": round(retention, 2)}
+            if retention < 0.8:
+                failures.append(f"garment_texture_lost: fabric micro-texture/structure retention {retention:.2f} (< 0.8 vs reference)")
+            if fine_ret > 1.35:
+                failures.append(f"garment_texture_noisy: fabric fine detail {fine_ret:.2f}x reference (> 1.35)")
+            loss = np.clip(1.0 - cv2.GaussianBlur(fine, (0, 0), 12.0) / np.maximum(cv2.GaussianBlur(ref_fine, (0, 0), 12.0), 1e-3), 0.0, 1.0)
+            hotspots += [("garment_texture", v, x, y) for v, x, y in _top_peaks(np.where(gmask, loss, 0.0), 2, 0.0, 260)]
+
+    # 5e. Auto hotspot 1:1 review crops at the worst places the checks found (not fixed boxes)
+    review_crops: dict[str, str] = {}
+    if hotspots:
+        overview = img_bgr.copy()
+        for idx, (label, _, x, y) in enumerate(hotspots, 1):
+            x0 = int(np.clip(x - 256, 0, max(0, w - 512)))
+            y0 = int(np.clip(y - 256, 0, max(0, h - 512)))
+            x1, y1 = min(w, x0 + 512), min(h, y0 + 512)
+            hp = out_dir / f"hot_{idx:02d}_{label}_{x}_{y}_1to1.png"
+            _write_png_u8(hp, img_bgr[y0:y1, x0:x1], overwrite=args.overwrite)
+            review_crops[f"{idx:02d}_{label}"] = str(hp)
+            cv2.rectangle(overview, (x0, y0), (x1 - 1, y1 - 1), (0, 0, 255), 8)
+            cv2.putText(overview, str(idx), (x0 + 12, y0 + 70), cv2.FONT_HERSHEY_SIMPLEX, 2.4, (0, 0, 255), 6)
+        out_hot = out_dir / "audit_hotspots_overview.png"
+        _save_preview_rgb(out_hot, cv2.cvtColor(overview, cv2.COLOR_BGR2RGB), max_side=1400, overwrite=args.overwrite)
+        outputs["audit_hotspots_overview"] = str(out_hot)
+
+    # 4. Standalone True 1:1 Single-Region Crops (NO downscaled multi-panel collapse)
+    crops_saved: dict[str, str] = {}
+    for spec in (args.crop or []):
+        if ":" not in spec:
+            raise ValueError(f"Invalid --crop '{spec}'; expected name:x,y,w,h")
+        cname, box = spec.split(":", 1)
+        cx, cy, cw, ch = _parse_crop_spec(box)
+        x0 = max(0, min(w - 1, cx))
+        y0 = max(0, min(h - 1, cy))
+        x1 = max(x0 + 1, min(w, x0 + cw))
+        y1 = max(y0 + 1, min(h, y0 + ch))
+        crop_p = out_dir / f"crop_{cname}_1to1.png"
+        _write_png_u8(crop_p, img_bgr[y0:y1, x0:x1], overwrite=args.overwrite)
+        crops_saved[cname] = str(crop_p)
+        outputs[f"crop_{cname}"] = str(crop_p)
+
+    numeric_pass = len(failures) == 0
+    payload = {
+        "ok": True,
+        "pass": numeric_pass,
+        "visual_review": "done" if args.visual_reviewed else "unverified",
+        "verdict": "FAIL" if not numeric_pass else ("PASS" if args.visual_reviewed else "NUMERIC_PASS_VISUAL_UNVERIFIED"),
+        "failures": failures,
+        "input": str(in_path),
+        "checks": checks,
+        "crops_1to1": crops_saved,
+        "review_crops_1to1": review_crops,
+        "outputs": outputs,
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
 def cmd_painterly(args: argparse.Namespace) -> int:
     sub = [
         "painterly",
@@ -1252,6 +1940,179 @@ def cmd_painterly(args: argparse.Namespace) -> int:
     return _run_gen_subcmd(sub)
 
 
+def cmd_hair_comp(args: argparse.Namespace) -> int:
+    from workbench_ops import run_hair_comp
+
+    payload = run_hair_comp(
+        subject_rgba_path=Path(args.subject_rgba).resolve(),
+        subject_hair_mask_path=Path(args.subject_hair_mask).resolve(),
+        protected_mask_path=Path(args.protected_mask).resolve(),
+        out_dir=Path(args.out_dir).resolve(),
+        occluder_mask_path=Path(args.occluder_mask).resolve() if args.occluder_mask else None,
+        accessories_mask_path=Path(args.accessories_mask).resolve() if args.accessories_mask else None,
+        mode=args.mode,
+        gen_hair_rgb_path=Path(args.gen_hair_rgb).resolve() if args.gen_hair_rgb else None,
+        gen_hair_matte_path=Path(args.gen_hair_matte).resolve() if args.gen_hair_matte else None,
+        gen_hair_mask_path=Path(args.gen_hair_mask).resolve() if args.gen_hair_mask else None,
+        clean_trapped_gaps=bool(args.clean_trapped_gaps),
+        haze_recover=float(args.haze_recover),
+        decontam_strength=float(args.decontam_strength),
+        groom=bool(args.groom),
+        groom_strength=float(args.groom_strength),
+        overwrite=args.overwrite,
+    )
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_hair_paint(args: argparse.Namespace) -> int:
+    from workbench_ops import run_hair_paint
+
+    payload = run_hair_paint(
+        subject_rgba_path=Path(args.subject_rgba).resolve(),
+        hair_mask_path=Path(args.hair_mask).resolve(),
+        out_dir=Path(args.out_dir).resolve(),
+        occluder_mask_path=Path(args.occluder_mask).resolve() if args.occluder_mask else None,
+        face_mask_path=Path(args.face_mask).resolve() if args.face_mask else None,
+        eyes_brows_mask_path=Path(args.eyes_brows_mask).resolve() if args.eyes_brows_mask else None,
+        clothes_mask_path=Path(args.clothes_mask).resolve() if args.clothes_mask else None,
+        wind_dir=args.wind_dir,
+        intensity=args.intensity,
+        seed=int(args.seed),
+        overwrite=args.overwrite,
+    )
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_garment_retouch(args: argparse.Namespace) -> int:
+    from workbench_ops import run_garment_retouch
+
+    payload = run_garment_retouch(
+        input_path=Path(args.input).resolve(),
+        out_path=Path(args.out).resolve(),
+        garment_mask_path=Path(args.garment_mask).resolve() if args.garment_mask else None,
+        body_parse_dir=Path(args.body_parse_dir).resolve() if args.body_parse_dir else None,
+        alpha_mask_path=Path(args.alpha_mask).resolve() if args.alpha_mask else None,
+        out_patch_path=Path(args.out_patch).resolve() if args.out_patch else None,
+        out_dark_mask_path=Path(args.out_dark_mask).resolve() if args.out_dark_mask else None,
+        material=args.material,
+        spatial_dehaze=float(args.spatial_dehaze),
+        target_black_l=str(args.target_black_l),
+        neutral_black=float(args.neutral_black),
+        drape_contrast=float(args.drape_contrast),
+        weave_preserve=float(args.weave_preserve),
+        overwrite=args.overwrite,
+    )
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_skin_unify(args: argparse.Namespace) -> int:
+    from workbench_ops import run_skin_unify
+
+    payload = run_skin_unify(
+        input_path=Path(args.input).resolve(),
+        body_parse_dir=Path(args.body_parse_dir).resolve(),
+        out_path=Path(args.out).resolve(),
+        alpha_mask_path=Path(args.alpha_mask).resolve() if args.alpha_mask else None,
+        out_patch_path=Path(args.out_patch).resolve() if args.out_patch else None,
+        warmth_pull=float(args.warmth_pull),
+        glare_compress=float(args.glare_compress),
+        skirt_shadow=float(args.skirt_shadow),
+        defringe=bool(args.defringe),
+        overwrite=args.overwrite,
+    )
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_harmonize(args: argparse.Namespace) -> int:
+    _ensure_cuda_dlls()
+    from workbench_ops import run_harmonize
+
+    payload = run_harmonize(
+        fg_rgba_path=Path(args.fg_rgba).resolve(),
+        bg_path=Path(args.bg).resolve(),
+        out_dir=Path(args.out_dir).resolve(),
+        pih_curves_path=PIH_CURVES_MODEL,
+        pih_gain_path=PIH_GAIN_MODEL,
+        skin_mask_path=Path(args.skin_mask).resolve() if args.skin_mask else None,
+        garment_dark_mask_path=Path(args.garment_dark_mask).resolve() if args.garment_dark_mask else None,
+        backend=args.backend,
+        strength=float(args.strength),
+        gain_strength=float(args.gain_strength),
+        skin_preserve=float(args.skin_preserve),
+        light_wrap=float(args.light_wrap),
+        grain_match=bool(args.grain_match),
+        overwrite=args.overwrite,
+    )
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_tile_split(args: argparse.Namespace) -> int:
+    from workbench_ops import run_tile_split
+
+    payload = run_tile_split(
+        input_path=Path(args.input).resolve(),
+        out_dir=Path(args.out_dir).resolve(),
+        grid=args.grid,
+        overlap=float(args.overlap),
+        max_tile_side=int(args.max_tile_side),
+        overwrite=args.overwrite,
+    )
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_tile_stitch(args: argparse.Namespace) -> int:
+    from workbench_ops import run_tile_stitch
+
+    payload = run_tile_stitch(
+        manifest_path=Path(args.manifest).resolve(),
+        tiles_dir=Path(args.tiles_dir).resolve(),
+        base_path=Path(args.base).resolve(),
+        out_path=Path(args.out).resolve(),
+        lock_lowfreq_sigma=float(args.lock_lowfreq_sigma),
+        ecc_align=bool(args.ecc_align),
+        detail_strength=float(args.detail_strength),
+        overwrite=args.overwrite,
+    )
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_tile_refine(args: argparse.Namespace) -> int:
+    sub = [
+        "tile-refine",
+        args.input,
+        "--out",
+        args.out,
+        "--prompt",
+        args.prompt,
+        "--negative-prompt",
+        args.negative_prompt,
+        "--denoise",
+        str(args.denoise),
+        "--control-scale",
+        str(args.control_scale),
+        "--guidance",
+        str(args.guidance),
+        "--steps",
+        str(args.steps),
+        "--tile-size",
+        str(args.tile_size),
+        "--overlap",
+        str(args.overlap),
+        "--seed",
+        str(args.seed),
+    ]
+    if args.overwrite:
+        sub.append("--overwrite")
+    return _run_gen_subcmd(sub)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="RetouchTools AI sidecar CLI")
     sub = p.add_subparsers(dest="command", required=True)
@@ -1275,12 +2136,36 @@ def build_parser() -> argparse.ArgumentParser:
     p_mt.add_argument("--overwrite", action="store_true", help="Allow overwriting existing output files")
     p_mt.set_defaults(func=cmd_matte)
 
-    p_bp = sub.add_parser("body-parse", help="6-class body segmentation (hair/body-skin/face-skin/clothes/accessories)")
+    p_bp = sub.add_parser("body-parse", help="18-class SegFormer-B2 Clothes (default) or 6-class MediaPipe body/garment segmentation")
     p_bp.add_argument("input", help="Input portrait image path (read-only)")
-    p_bp.add_argument("--out-dir", required=True, help="Directory to write 6 grayscale PNG masks")
+    p_bp.add_argument("--out-dir", required=True, help="Directory to write grayscale PNG masks and preview_parse_overlay.png")
     p_bp.add_argument("--refine-with-matte", help="Optional alpha matte PNG to sharpen outer hair/edge bounds")
+    p_bp.add_argument("--backend", default="auto", choices=["auto", "segformer", "mediapipe"], help="Segmentation backend (default: auto -> SegFormer-B2)")
+    p_bp.add_argument("--guided-radius", type=int, default=12, help="Guided filter radius for edge snapping (0=off, default: 12)")
     p_bp.add_argument("--overwrite", action="store_true", help="Allow overwriting existing output files")
     p_bp.set_defaults(func=cmd_body_parse)
+
+    p_ma = sub.add_parser("mask-audit", help="Automated hole/ghosting/tone-jump audit, neon overlays, and standalone true 1:1 crops")
+    p_ma.add_argument("input", help="Input composite or subject image path (read-only)")
+    p_ma.add_argument("--out-dir", required=True, help="Directory to write audit overlays and standalone 1:1 crops")
+    p_ma.add_argument("--protected-mask", help="Canonical non-hair body/garment mask PNG (e.g. mask_protected_body.png)")
+    p_ma.add_argument("--trim-mask", help="Subject trim mask PNG (e.g. 04a_subject_4k_hair_trim_mask.png)")
+    p_ma.add_argument("--garment-mask", help="Single garment mask PNG for tone-jump check (e.g. mask_skirt_dress.png)")
+    p_ma.add_argument("--hair-alpha", help="Resculpted hair RGBA or grayscale alpha PNG")
+    p_ma.add_argument("--native-hair-mask", help="SegFormer hair mask for real-first runs without external hair cutout")
+    p_ma.add_argument("--eyes-brows-mask", help="Transformed eyes & brows mask PNG")
+    p_ma.add_argument("--crop", action="append", help="Standalone 1:1 crop formatted as name:x,y,w,h (repeatable)")
+    p_ma.add_argument("--hair-layer", action="append", help="Extra visible hair layer RGBA/alpha PNG, unioned with --hair-alpha for continuity (repeatable)")
+    p_ma.add_argument("--reference", help="Pixel-aligned reference image (e.g. 01_beauty_base) for hair/garment texture comparison")
+    p_ma.add_argument("--reference-hair-mask", help="Hair mask of --reference for hair texture comparison")
+    p_ma.add_argument("--subject-alpha", help="Subject alpha or RGBA cutout for the subject-background blend check")
+    p_ma.add_argument("--asset", action="append", help="Native-resolution gate for a generated/placed source: NAME=PATH[|x,y,w,h it was mapped onto] (repeatable)")
+    p_ma.add_argument("--occluder-mask", help="Mask of body parts in front of hair (arms/hands/face) for occlusion break audit")
+    p_ma.add_argument("--neutral-garment", action="store_true", help="Fail if neutral dark garment interior shows brown/warm Lab color cast")
+    p_ma.add_argument("--style", default="photo", choices=["photo", "painterly"], help="Texture gate strictness (default: photo)")
+    p_ma.add_argument("--visual-reviewed", action="store_true", help="Set ONLY after actually viewing every review crop; otherwise verdict stays NUMERIC_PASS_VISUAL_UNVERIFIED")
+    p_ma.add_argument("--overwrite", action="store_true", help="Allow overwriting existing output files")
+    p_ma.set_defaults(func=cmd_mask_audit)
 
     p_up = sub.add_parser("upscale", help="GPU Vulkan super-resolution via MIT Real-ESRGAN-ncnn-vulkan")
     p_up.add_argument("input", help="Input image path (read-only)")
@@ -1293,6 +2178,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_up.add_argument("--scale", type=int, default=2, choices=[2, 4], help="Target upscale factor (2 or 4)")
     p_up.add_argument("--tile", type=int, default=0, help="Tile size (0=auto, >=32)")
+    p_up.add_argument("--style", default="photo", choices=["photo", "anime"], help="photo dampens waxy GAN ridges (default: photo)")
     p_up.add_argument("--overwrite", action="store_true", help="Allow overwriting existing output file")
     p_up.set_defaults(func=cmd_upscale)
 
@@ -1402,6 +2288,119 @@ def build_parser() -> argparse.ArgumentParser:
     p_fr.add_argument("--no-nostril-clean", action="store_true", help="Disable extra GFPGAN blend on nostril rim")
     p_fr.add_argument("--overwrite", action="store_true")
     p_fr.set_defaults(func=cmd_face_restore)
+
+    p_hc = sub.add_parser("hair-comp", help="Style-adaptive, occlusion-clean hair compositing")
+    p_hc.add_argument("--subject-rgba", required=True, help="RGBA subject cutout PNG")
+    p_hc.add_argument("--subject-hair-mask", required=True, help="SegFormer hair mask PNG")
+    p_hc.add_argument("--protected-mask", required=True, help="SegFormer protected body mask PNG")
+    p_hc.add_argument("--occluder-mask", help="Body-in-front-of-hair mask PNG (arms/hands/face)")
+    p_hc.add_argument("--accessories-mask", help="Optional accessories/ribbon mask PNG to protect from gap cleanup")
+    p_hc.add_argument("--mode", default="real-first", choices=["real-first", "hybrid-flow", "full-replace"])
+    p_hc.add_argument("--gen-hair-rgb", help="Generated hair RGB PNG (for hybrid-flow/full-replace)")
+    p_hc.add_argument("--gen-hair-matte", help="Generated foreground matte PNG")
+    p_hc.add_argument("--gen-hair-mask", help="Generated semantic hair mask PNG")
+    p_hc.add_argument("--clean-trapped-gaps", action=argparse.BooleanOptionalAction, default=True)
+    p_hc.add_argument("--haze-recover", type=float, default=0.35)
+    p_hc.add_argument("--decontam-strength", type=float, default=0.75)
+    p_hc.add_argument("--groom", action=argparse.BooleanOptionalAction, default=True)
+    p_hc.add_argument("--groom-strength", type=float, default=0.38)
+    p_hc.add_argument("--out-dir", required=True)
+    p_hc.add_argument("--overwrite", action="store_true")
+    p_hc.set_defaults(func=cmd_hair_comp)
+
+    p_hp = sub.add_parser("hair-paint", help="Native PhotoCraft 3-brush layered COS hair painting")
+    p_hp.add_argument("--subject-rgba", required=True, help="RGBA subject PNG (preserves real hair)")
+    p_hp.add_argument("--hair-mask", required=True, help="SegFormer hair mask PNG")
+    p_hp.add_argument("--occluder-mask", help="Arms/hands/face occluder mask PNG for 0px flush erase")
+    p_hp.add_argument("--face-mask", help="Face skin mask PNG for bangs wisps & eye protection")
+    p_hp.add_argument("--eyes-brows-mask", help="Eyes & brows mask PNG for strict eye protection")
+    p_hp.add_argument("--clothes-mask", help="Clothes mask PNG for flush shoulder/costume erase")
+    p_hp.add_argument("--wind-dir", default="auto", choices=["down-left", "down-right", "left", "right", "auto"])
+    p_hp.add_argument("--intensity", default="medium", choices=["subtle", "medium", "dramatic"])
+    p_hp.add_argument("--seed", type=int, default=42)
+    p_hp.add_argument("--out-dir", required=True)
+    p_hp.add_argument("--overwrite", action="store_true")
+    p_hp.set_defaults(func=cmd_hair_paint)
+
+    p_gr = sub.add_parser("garment-retouch", help="Material-aware CIE Lab frequency separation & luminance dehaze for garments")
+    p_gr.add_argument("input", help="Input RGB or RGBA PNG")
+    p_gr.add_argument("--garment-mask", help="Single garment grayscale mask PNG")
+    p_gr.add_argument("--body-parse-dir", help="SegFormer body-parse dir for multi-garment auto retouch")
+    p_gr.add_argument("--alpha-mask", help="Optional subject alpha matte PNG")
+    p_gr.add_argument("--material", default="auto", choices=["auto", "dark-matte", "dark-twill", "light-cotton", "glossy-leather"])
+    p_gr.add_argument("--spatial-dehaze", type=float, default=-1.0)
+    p_gr.add_argument("--target-black-l", default="14.0", help="Target CIE L* black level or 'upper'")
+    p_gr.add_argument("--neutral-black", type=float, default=-1.0)
+    p_gr.add_argument("--drape-contrast", type=float, default=0.35)
+    p_gr.add_argument("--weave-preserve", type=float, default=1.0)
+    p_gr.add_argument("--out", required=True, help="Retouched output PNG")
+    p_gr.add_argument("--out-patch", help="Optional transparent garment delta/patch RGBA PNG for PhotoCraft")
+    p_gr.add_argument("--out-dark-mask", help="Optional full dark-garment union grayscale PNG (skirt+socks+shoes+residual) for harmonize protection")
+    p_gr.add_argument("--overwrite", action="store_true")
+    p_gr.set_defaults(func=cmd_garment_retouch)
+
+    p_su = sub.add_parser("skin-unify", help="Unify washed lower-limb skin with arms + defringe + skirt/leg cast & AO shadow")
+    p_su.add_argument("input", help="Input RGB or RGBA PNG")
+    p_su.add_argument("--body-parse-dir", required=True, help="SegFormer body-parse directory")
+    p_su.add_argument("--alpha-mask", help="Optional subject alpha matte PNG")
+    p_su.add_argument("--warmth-pull", type=float, default=0.72)
+    p_su.add_argument("--glare-compress", type=float, default=0.62)
+    p_su.add_argument("--skirt-shadow", type=float, default=0.42)
+    p_su.add_argument("--defringe", action=argparse.BooleanOptionalAction, default=True)
+    p_su.add_argument("--out", required=True, help="Skin-unified output PNG")
+    p_su.add_argument("--out-patch", help="Optional transparent leg skin patch RGBA PNG for PhotoCraft")
+    p_su.add_argument("--overwrite", action="store_true")
+    p_su.set_defaults(func=cmd_skin_unify)
+
+    p_hm = sub.add_parser("harmonize", help="Subject-background harmonization via Apache-2.0 PhotoBlaze-PIH ONNX")
+    p_hm.add_argument("--fg-rgba", required=True, help="RGBA subject cutout PNG")
+    p_hm.add_argument("--bg", required=True, help="Aligned background RGB PNG")
+    p_hm.add_argument("--skin-mask", help="Optional grayscale skin mask PNG")
+    p_hm.add_argument("--garment-dark-mask", help="Optional neutral dark garment mask PNG")
+    p_hm.add_argument("--backend", default="auto", choices=["auto", "pih", "analytical"])
+    p_hm.add_argument("--strength", type=float, default=0.70)
+    p_hm.add_argument("--gain-strength", type=float, default=0.50)
+    p_hm.add_argument("--skin-preserve", type=float, default=0.60)
+    p_hm.add_argument("--light-wrap", type=float, default=0.22)
+    p_hm.add_argument("--grain-match", action="store_true")
+    p_hm.add_argument("--out-dir", required=True)
+    p_hm.add_argument("--overwrite", action="store_true")
+    p_hm.set_defaults(func=cmd_harmonize)
+
+    p_ts = sub.add_parser("tile-split", help="Split high-res canvas into overlapping tiles with manifest")
+    p_ts.add_argument("input", help="Input image PNG")
+    p_ts.add_argument("--out-dir", required=True)
+    p_ts.add_argument("--grid", default="2x2")
+    p_ts.add_argument("--overlap", type=float, default=0.22)
+    p_ts.add_argument("--max-tile-side", type=int, default=1400)
+    p_ts.add_argument("--overwrite", action="store_true")
+    p_ts.set_defaults(func=cmd_tile_split)
+
+    p_tx = sub.add_parser("tile-stitch", help="Frequency-locked subpixel-aligned stitch of refined tiles")
+    p_tx.add_argument("--manifest", required=True)
+    p_tx.add_argument("--tiles-dir", required=True)
+    p_tx.add_argument("--base", required=True)
+    p_tx.add_argument("--out", required=True)
+    p_tx.add_argument("--lock-lowfreq-sigma", type=float, default=48.0)
+    p_tx.add_argument("--ecc-align", action=argparse.BooleanOptionalAction, default=True)
+    p_tx.add_argument("--detail-strength", type=float, default=0.85)
+    p_tx.add_argument("--overwrite", action="store_true")
+    p_tx.set_defaults(func=cmd_tile_stitch)
+
+    p_tr = sub.add_parser("tile-refine", help="Optional venv-gen SD1.5 ControlNet-Tile photographic detail refinement")
+    p_tr.add_argument("input")
+    p_tr.add_argument("--out", required=True)
+    p_tr.add_argument("--prompt", default="masterpiece architectural photograph, crisp weathered natural limestone pores, delicate natural leaves and rose petals")
+    p_tr.add_argument("--negative-prompt", default="oil painting, anime, illustration, CGI grid, blurry, plastic")
+    p_tr.add_argument("--denoise", type=float, default=0.30)
+    p_tr.add_argument("--control-scale", type=float, default=0.90)
+    p_tr.add_argument("--guidance", type=float, default=5.5)
+    p_tr.add_argument("--steps", type=int, default=20)
+    p_tr.add_argument("--tile-size", type=int, default=768)
+    p_tr.add_argument("--overlap", type=int, default=160)
+    p_tr.add_argument("--seed", type=int, default=42)
+    p_tr.add_argument("--overwrite", action="store_true")
+    p_tr.set_defaults(func=cmd_tile_refine)
 
     return p
 

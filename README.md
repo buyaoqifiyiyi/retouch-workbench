@@ -12,10 +12,11 @@
 | :--- | :--- | :--- | :--- |
 | **ArtCraft PhotoCraft** (`photocraft-cli`) | MIT OR Apache-2.0 | 单张分层精修、皮肤高低频、冻区骨相液化、图层/矢量蒙版、混合画笔、压感路径勾丝、`.pcraft`/`.psd` 读写 | 无损 `.pcraft`、兼容 `.psd`、4K 发布成片 |
 | **ArtCraft LightCraft** (`lightcraft-cli`) | MIT OR Apache-2.0 | 批量导入、选片、白平衡/曲线/HSL/LUT 同组暗房同步、16-bit/32-bit 显影导出 | 无损调整日志、标准 16-bit PNG/TIFF 底图 |
-| **核心 AI 侧车** (`scripts/retouch-ai.py`) | MIT / Apache-2.0 / BSD | 106 关键点冻区与 19 类人脸语义（`face-parse`）、发丝与半透明配饰抠图（`matte`：`BiRefNet_lite` / `PP-Matting V2`）、全身 6 类分割（`body-parse`）、ROI 局部消除（`inpaint`：`LaMa`）、Vulkan 写实超分（`upscale`：`Real-ESRGAN`）、面部清锐恢复（`face-restore`：`GFPGAN v1.4 ONNX`）、自然奶油肌（`skin-retouch`：`DAMO ABPN`）、像素对位与量化质检（`qa` / `compare`） | 严格互斥 PNG 蒙版、`faces.json` 冻区点位、透明局部补丁、4K 超分底图 |
+| **核心 AI 侧车** (`scripts/retouch-ai.py` + `workbench_ops.py`) | MIT / Apache-2.0 / BSD | 106 关键点冻区与人脸 19 类语义（`face-parse`）、发丝与半透明精抠（`matte`：`BiRefNet_lite` / `PP-Matting V2`）、全身 18 类分割（`body-parse`：默认 `SegFormer-B2 Clothes` + 引导滤波，回退 `MediaPipe`）、服饰分材质三频去雾与去白边（`garment-retouch`，支持 `--out-dark-mask`）、下肢肤色与裙/腿遮挡影统一（`skin-unify`）、自适应风格合发与轻理顺（`hair-comp --groom`）、PhotoCraft 原生细丝束分层画发（`hair-paint`）、Apache-2.0 PIH ONNX 溶图调和（`harmonize`）、分块高清拼合（`tile-split` / `tile-stitch`）、ROI 局部消除（`inpaint`：`LaMa`）、Vulkan 超分（`upscale`）、面部复原（`face-restore`）、奶油磨皮（`skin-retouch`）与自动掩码/纹理体检（`mask-audit` / `qa` / `compare`） | 严格互斥 PNG 蒙版、`faces.json` 冻区点位、前后景飘发透明层、非破坏局部补丁与 1:1 体检报告 |
+| **3D 物理阴影侧车** (`scripts/blender-shadow-catcher.py`) | MIT | 将精抠主体立牌放进 Blender 极简白模 Cycles `Shadow Catcher` 渲染同光向投影与地面微倒影，并输出 Z 深度图给 PhotoCraft 景深模糊 | 同透视方向阴影与 Z 深度图层 |
 | **可选 6GB 显存本地重打光/笔触通道** (`scripts/retouch-gen.py`) | Apache-2.0 / OpenRAIL-M | 在独立隔离 `venv-gen` 中运行 `IC-Light` 环境光包裹与 `Counterfeit-V3.0 + ControlNet Tile` 笔触参考 | 环境光迁移层与受控局部质感底图 |
 | **像素头校验与本地裁切** (`scripts/inspect-image.mjs`) | MIT | 检查真实文件头编码（识别伪装 `.png` 后缀的 JPEG）、尺寸、位深及导出 1:1 局部像素对比图 | JSON 元数据、1:1 局部校验切片 |
-| **COS 与人像方法库** (`SKILL.md` & `references/`) | — | `Beauty-First` 前置门禁、骨相液化五大原则、奶油瓷白肌 3 步调色、反贴纸眼唇、藏色发束与“走势底稿 + 强图模直出 + PhotoCraft 前景锁罩回贴”SOP | 可直接约束 Agent 行为的工程化方法卡 |
+| **COS 与人像方法库** (`SKILL.md` & `references/`) | — | `Beauty-First` 前置门禁、骨相液化五大原则、奶油瓷白肌 3 步调色、服饰纯明度精修与下肢统一、原生单丝束画发、Blender 白模协同抽卡+PIH 溶图及防糊斑避坑体系 | 可直接约束 Agent 行为的工程化方法卡 |
 
 ---
 
@@ -28,15 +29,23 @@ retouch-workbench/
 ├── README.md
 ├── docs/
 │   └── mcp.md                        # PhotoCraft / LightCraft MCP 与桌面桥接指南
+├── resources/
+│   └── brushes/                      # 永久灰度发丝笔刷笔尖（hair_01_multi_clump / hair_02_fine_clump / hair_03_single_strand）
 ├── references/
-│   ├── workflows.md                  # 场照（field）/ 正片（formal）标准流程与防翻车自检
+│   ├── workflows.md                  # 场照（field）/ 正片（formal）两阶段标准流程与故障排查
 │   ├── liquify-guide.md              # 骨相液化五大原则、冻区设置与照镜子验收
 │   ├── natural-beauty-guide.md       # 自然精修与 3 步不偏灰奶油瓷白肌调色
-│   ├── painterly-methods.md          # 2.5D COS 厚涂方法卡与走势底稿+强图模+锁罩回贴 SOP
-│   ├── techniques-and-pitfalls.md    # 显影、高低频、选区修边与输出避坑细则
+│   ├── garment-retouch-guide.md      # 服饰三频纯明度去雾、--out-dark-mask 与 alpha-only 去白边
+│   ├── hair-painting-guide.md        # COS 前后分层细丝束画发丝指南与 hair-paint 实战
+│   ├── compositing-guide.md          # COS 专业合成溶图（Blender白模/PIH/三层影/景深/颗粒/反塑料）
+│   ├── color-lighting-guide.md       # 调色、光影重塑与 4:1 重打光指南
+│   ├── painterly-methods.md          # 2.5D COS 厚涂方法卡与锁罩回贴 SOP
+│   ├── techniques-and-pitfalls.md    # 显影、高低频、去边、防语义误判与输出避坑细则
 │   └── learning-roadmap.md           # 12 类后期技能成长路线与公开参考索引
 └── scripts/
     ├── retouch-ai.py                 # 主力本地开源 AI 侧车 CLI
+    ├── workbench_ops.py              # hair-comp / hair-paint / garment-retouch / skin-unify / harmonize / tile 核心实现
+    ├── blender-shadow-catcher.py     # Blender Cycles Shadow Catcher 立牌投影与 ZDepth 生成脚本
     ├── retouch-gen.py                # 可选 6GB CUDA 显存隔离生图管线（IC-Light + Tile）
     ├── gfpgan_runner.py              # GFPGAN v1.4 ONNX 独立运行器
     ├── skin_retouch_runner.py        # DAMO ABPN 磨皮美白 + 106 关键点 COS 液化运行器
@@ -70,7 +79,9 @@ retouch-workbench/
 | 模型组件 | 开源协议 | 下载地址（主用镜像 / 官方原址） | 目标存放路径（相对 `%LOCALAPPDATA%\RetouchTools\`） |
 | :--- | :--- | :--- | :--- |
 | **BiRefNet_lite ONNX**（发丝与半透明饰品精抠） | MIT | [ModelScope](https://modelscope.cn/models/onnx-community/BiRefNet_lite-ONNX/resolve/master/onnx/model.onnx) · [hf-mirror](https://hf-mirror.com/onnx-community/BiRefNet_lite-ONNX/resolve/main/onnx/model.onnx) · [HuggingFace](https://huggingface.co/onnx-community/BiRefNet_lite-ONNX/resolve/main/onnx/model.onnx) | `models/birefnet/birefnet_lite.onnx` |
-| **MediaPipe Selfie Multiclass**（6 类全身分割） | Apache-2.0 | [Google Storage](https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite) | `models/selfie_multiclass_256x256.tflite` |
+| **SegFormer-B2 Clothes ONNX**（18 类默认人体/服饰精准解析） | MIT | [hf-mirror (mattmdjaga)](https://hf-mirror.com/mattmdjaga/segformer_b2_clothes/resolve/main/onnx/model.onnx) · [hf-mirror (Xenova)](https://hf-mirror.com/Xenova/segformer_b2_clothes/resolve/main/onnx/model.onnx) | `models/segformer/segformer_b2_clothes.onnx` |
+| **PhotoBlaze-PIH ONNX**（`curves.onnx` + `gain.onnx` 溶图调和） | Apache-2.0 | [hf-mirror](https://hf-mirror.com/JeremySD99/PhotoBlaze-PIH/tree/main) · [HuggingFace](https://huggingface.co/JeremySD99/PhotoBlaze-PIH/tree/main) | `models/pih/` |
+| **MediaPipe Selfie Multiclass**（6 类全身分割回退） | Apache-2.0 | [Google Storage](https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite) | `models/selfie_multiclass_256x256.tflite` |
 | **LaMa (`big-lama.pt`)**（ROI 局部无痕消除） | Apache-2.0 | [GitHub Release](https://github.com/enesmsahin/simple-lama-inpainting/releases/download/v0.1.0/big-lama.pt) | `models/lama/big-lama.pt` |
 | **GFPGAN v1.4 ONNX**（眼睫与超分黑线微修） | Apache-2.0 | [hf-mirror](https://hf-mirror.com/facefusion/models-3.0.0/resolve/main/gfpgan_1.4.onnx) · [HuggingFace](https://huggingface.co/facefusion/models-3.0.0/resolve/main/gfpgan_1.4.onnx) | `models/gfpgan/gfpgan_1.4.onnx` |
 | **DAMO ABPN 磨皮美白**（`cv_unet_skin_retouching_torch`） | Apache-2.0 | [ModelScope 模型仓库](https://www.modelscope.cn/models/damo/cv_unet_skin_retouching_torch/files)（`pytorch_model.pt`、`joint_20210926.pth`、`model.onnx`） | `models/skin-retouching/` |
@@ -118,22 +129,37 @@ python scripts\download_models.py --dry-run
 ```powershell
 $py = "$env:LOCALAPPDATA\RetouchTools\venv\Scripts\python.exe"
 
-# 环境与 GPU / 模型自检
+# 环境与 GPU / 模型 / 画笔自检
 & $py scripts\retouch-ai.py doctor
 
 # 人脸 106 关键点 + 19 类语义分割 + 液化五官冻区导出
-& $py scripts\retouch-ai.py face-parse --input photo.png --out-dir work\face
+& $py scripts\retouch-ai.py face-parse photo.png --out-dir work\face
 
 # 发丝与半透明饰品高精度前景抠图（BiRefNet_lite）
-& $py scripts\retouch-ai.py matte --input photo.png --model birefnet-lite --out-mask work\matte.png
+& $py scripts\retouch-ai.py matte photo.png --model birefnet-lite --out-mask work\matte.png
 
-# 全身 6 类分割（配合抠图细化）
-& $py scripts\retouch-ai.py body-parse --input photo.png --refine-with-matte work\matte.png --out-dir work\body
+# 全身 18 类 SegFormer-B2 语义分割（配合抠图细化）
+& $py scripts\retouch-ai.py body-parse photo.png --refine-with-matte work\matte.png --out-dir work\body
 
-# Real-ESRGAN 写实 4x 超分（COS 真人严禁使用 anime 模型）
-& $py scripts\retouch-ai.py upscale --input photo.png --scale 4 --out work\photo_4k.png
+# 服饰分材质去雾 + 完整深色服装/鞋袜联合保护罩导出
+& $py scripts\retouch-ai.py garment-retouch work\fg_rgba.png --body-parse-dir work\body --out work\fg_garment.png --out-dark-mask work\dark_full_mask.png --overwrite
 
-# 真实编码检验与 1:1 像素切片
+# 下肢褪色炫光肤色统一 + 外缘去白边 + 裙/腿遮挡影
+& $py scripts\retouch-ai.py skin-unify work\fg_garment.png --body-parse-dir work\body --out work\fg_skin.png --overwrite
+
+# 实拍真发去杂边 + 漂白反光回暖 + 顺发流轻理顺
+& $py scripts\retouch-ai.py hair-comp --subject-rgba work\fg_skin.png --subject-hair-mask work\body\mask_hair.png --protected-mask work\body\mask_protected_body.png --occluder-mask work\body\mask_occluder_arms_face.png --mode real-first --groom --out-dir work\hair_comp --overwrite
+
+# PhotoBlaze-PIH ONNX 溶图调和（透传完整深色服装保护罩）
+& $py scripts\retouch-ai.py harmonize --fg-rgba work\hair_comp\hair_comp_subject_rgba.png --bg work\bg.png --skin-mask work\body\mask_all_skin.png --garment-dark-mask work\dark_full_mask.png --grain-match --out-dir work\harmonize --overwrite
+
+# PhotoCraft 原生极细单丝束前后分层飘逸画发
+& $py scripts\retouch-ai.py hair-paint --subject-rgba work\harmonize\harmonized_fg_rgba.png --hair-mask work\body\mask_hair.png --occluder-mask work\body\mask_occluder_arms_face.png --face-mask work\body\mask_face_skin.png --eyes-brows-mask work\body\mask_eyes_brows.png --clothes-mask work\body\mask_clothes_all.png --wind-dir auto --intensity medium --out-dir work\hair_paint --overwrite
+
+# 全项掩码与 1:1 切片体检（注意：亲眼核查切片后方可使用 --visual-reviewed）
+& $py scripts\retouch-ai.py mask-audit final.png --out-dir work\audit --protected-mask work\body\mask_protected_body.png --garment-mask work\body\mask_skirt_dress.png --native-hair-mask work\body\mask_hair.png --eyes-brows-mask work\body\mask_eyes_brows.png --reference work\fg_rgb.png --reference-hair-mask work\body\mask_hair.png --neutral-garment --overwrite
+
+# 真实编码检验与 1:1 像素裁切
 node scripts\inspect-image.mjs inspect photo.png
 ```
 
