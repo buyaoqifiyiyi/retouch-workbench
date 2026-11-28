@@ -118,43 +118,13 @@ FACE_PARSING_LABELS: tuple[str, ...] = (
     "hat",
 )
 
-_CUDA_DLL_INITIALIZED = False
-_DLL_HANDLES: list[Any] = []
-
-
 def _ensure_cuda_dlls() -> dict[str, Any]:
     """Register bundled NVIDIA CUDA/cuDNN bin dirs for ONNX Runtime on Windows."""
-    global _CUDA_DLL_INITIALIZED
-    info: dict[str, Any] = {"preloaded": False, "dll_dirs": []}
-    if _CUDA_DLL_INITIALIZED:
-        info["preloaded"] = True
-        return info
-
     os.environ.setdefault("UNIFACE_CACHE_DIR", str(UNIFACE_CACHE))
     os.environ.setdefault("U2NET_HOME", str(REMBG_CACHE))
+    from cuda_env import ensure_cuda_dlls
 
-    try:
-        import onnxruntime as ort  # type: ignore
-
-        if hasattr(ort, "preload_dlls"):
-            ort.preload_dlls()
-            info["preloaded"] = True
-
-        sp_root = Path(ort.__file__).resolve().parent.parent
-        nv_bins = sorted(glob.glob(str(sp_root / "nvidia" / "*" / "bin")))
-        path_parts = os.environ.get("PATH", "").split(os.pathsep)
-        for bin_dir in nv_bins:
-            info["dll_dirs"].append(bin_dir)
-            if hasattr(os, "add_dll_directory"):
-                _DLL_HANDLES.append(os.add_dll_directory(bin_dir))
-            if bin_dir not in path_parts:
-                path_parts.insert(0, bin_dir)
-        os.environ["PATH"] = os.pathsep.join(path_parts)
-        _CUDA_DLL_INITIALIZED = True
-    except Exception as exc:
-        info["error"] = str(exc)
-
-    return info
+    return ensure_cuda_dlls()
 
 
 def _build_minimal_identity_onnx() -> bytes:
@@ -1575,19 +1545,41 @@ def cmd_mask_audit(args: argparse.Namespace) -> int:
             p10 = float(np.percentile(luma_sm[core], 10))
             p50 = float(np.percentile(luma_sm[core], 50))
             p90 = float(np.percentile(luma_sm[core], 90))
-            jump_limit = 58.0 if p50 >= 120.0 else 38.0
-            checks["garment_tone_check"] = {
+            ref_max_jump: float | None = None
+            if args.reference:
+                ref_rgb_t = cv2.cvtColor(_read_bgr(Path(args.reference).resolve()), cv2.COLOR_BGR2RGB).astype(np.float32)
+                if ref_rgb_t.shape[:2] == (h, w):
+                    ref_luma = 0.2126 * ref_rgb_t[:, :, 0] + 0.7152 * ref_rgb_t[:, :, 1] + 0.0722 * ref_rgb_t[:, :, 2]
+                    ref_luma_sm = cv2.GaussianBlur(ref_luma, (0, 0), sigmaX=12.0)
+                    ref_bms = []
+                    for by in range(y_min, max(y_min + 1, y_max - 39), 20):
+                        bm = core[by:by + 40, :]
+                        if bm.sum() >= 300:
+                            ref_bms.append((by, float(ref_luma_sm[by:by + 40, :][bm].mean())))
+                    r_mj = 0.0
+                    for i in range(len(ref_bms)):
+                        for j in range(i + 1, len(ref_bms)):
+                            if 20 <= ref_bms[j][0] - ref_bms[i][0] <= 65:
+                                r_mj = max(r_mj, abs(ref_bms[j][1] - ref_bms[i][1]))
+                    ref_max_jump = r_mj
+
+            base_limit = 58.0 if p50 >= 120.0 else 38.0
+            jump_limit = max(base_limit, (ref_max_jump + 10.0) if ref_max_jump is not None else 0.0)
+            garment_tone_rec: dict[str, Any] = {
                 "interior_px": int(core.sum()),
                 "p10_luma": round(p10, 1),
                 "p50_luma": round(p50, 1),
                 "p90_luma": round(p90, 1),
                 "max_band_jump": round(max_jump, 1),
-                "jump_limit": jump_limit,
+                "jump_limit": round(jump_limit, 1),
                 "max_jump_y_pair": jump_y,
             }
+            if ref_max_jump is not None:
+                garment_tone_rec["ref_max_band_jump"] = round(ref_max_jump, 1)
+            checks["garment_tone_check"] = garment_tone_rec
             if max_jump > jump_limit:
                 failures.append(f"garment_internal_tone_jump: {max_jump:.1f} luma across y={jump_y} (limit {jump_limit:.1f})")
-            elif max_jump > 38.0:
+            elif max_jump > base_limit and p50 >= 120.0:
                 audit_warnings.append(
                     f"garment_internal_tone_gradient: {max_jump:.1f} luma across y={jump_y} (high-key p50={p50:.1f}; verify natural relighting shadow in audit_garment_overlay)"
                 )
@@ -1942,6 +1934,114 @@ def cmd_mask_audit(args: argparse.Namespace) -> int:
             loss = np.clip(1.0 - cv2.GaussianBlur(fine, (0, 0), 12.0) / np.maximum(cv2.GaussianBlur(ref_fine, (0, 0), 12.0), 1e-3), 0.0, 1.0)
             hotspots += [("garment_texture", v, x, y) for v, x, y in _top_peaks(np.where(gmask, loss, 0.0), 2, 0.0, 260)]
 
+    # 5d-2. Body skin micro-contrast & clarity retention check vs reference (catches Multiply+Screen fog or wax over-smoothing)
+    skin_raw: np.ndarray | None = None
+    if getattr(args, "skin_mask", None):
+        skin_raw = _read_gray_f32(Path(args.skin_mask).resolve(), (h, w))
+    if skin_raw is not None and ref_gray is not None:
+        smask = skin_raw >= 0.5
+        if getattr(args, "face_skin_mask", None):
+            fskin = _read_gray_f32(Path(args.face_skin_mask).resolve(), (h, w)) >= 0.35
+            smask &= ~(cv2.dilate(fskin.astype(np.uint8), _k(10)) > 0)
+        if args.eyes_brows_mask:
+            eb_ex = _read_gray_f32(Path(args.eyes_brows_mask).resolve(), (h, w)) >= 0.25
+            smask &= ~(cv2.dilate(eb_ex.astype(np.uint8), _k(8)) > 0)
+        if hair_union is not None:
+            smask &= hair_union < 0.3
+        elif getattr(args, "native_hair_mask", None):
+            nh_ex = _read_gray_f32(Path(args.native_hair_mask).resolve(), (h, w)) >= 0.3
+            smask &= ~nh_ex
+        smask = cv2.erode(smask.astype(np.uint8), _k(4)) > 0
+        if int(smask.sum()) >= 3000:
+            hp1 = gray - cv2.GaussianBlur(gray, (0, 0), 1.0)
+            hp3 = gray - cv2.GaussianBlur(gray, (0, 0), 3.0)
+            rhp1 = ref_gray - cv2.GaussianBlur(ref_gray, (0, 0), 1.0)
+            rhp3 = ref_gray - cv2.GaussianBlur(ref_gray, (0, 0), 3.0)
+            loc_l = np.maximum(cv2.GaussianBlur(gray, (0, 0), 16.0), 25.0)
+            rloc_l = np.maximum(cv2.GaussianBlur(ref_gray, (0, 0), 16.0), 25.0)
+            rel_hp1, rel_rhp1 = hp1 / loc_l, rhp1 / rloc_l
+            rel_hp3, rel_rhp3 = hp3 / loc_l, rhp3 / rloc_l
+            weber_hp1_ratio = float(rel_hp1[smask].std()) / max(1e-5, float(rel_rhp1[smask].std()))
+            weber_hp3_ratio = float(rel_hp3[smask].std()) / max(1e-5, float(rel_rhp3[smask].std()))
+            raw_hp1_ratio = float(hp1[smask].std()) / max(1e-5, float(rhp1[smask].std()))
+            raw_hp3_ratio = float(hp3[smask].std()) / max(1e-5, float(rhp3[smask].std()))
+            style_mode_b = getattr(args, "style", "photo")
+            if style_mode_b == "painterly":
+                fail_hp3, fail_hp1, warn_hp3 = 0.42, 0.35, 0.52
+            else:
+                fail_hp3, fail_hp1, warn_hp3 = 0.58, 0.52, 0.70
+            checks["body_skin_clarity_check"] = {
+                "body_skin_px": int(smask.sum()),
+                "weber_hp1_ratio": round(weber_hp1_ratio, 3),
+                "weber_hp3_ratio": round(weber_hp3_ratio, 3),
+                "raw_hp1_ratio": round(raw_hp1_ratio, 3),
+                "raw_hp3_ratio": round(raw_hp3_ratio, 3),
+                "style_min_hp3": fail_hp3,
+            }
+            triggered_body_soft = False
+            if weber_hp3_ratio < fail_hp3 or weber_hp1_ratio < fail_hp1:
+                triggered_body_soft = True
+                failures.append(
+                    f"body_skin_mushed_fog: body skin Weber micro-contrast ratio hp3={weber_hp3_ratio:.2f} (min {fail_hp3}), hp1={weber_hp1_ratio:.2f} (min {fail_hp1}); check Multiply+Screen fog stack or excessive smoothing"
+                )
+            elif weber_hp3_ratio < warn_hp3:
+                triggered_body_soft = True
+                audit_warnings.append(
+                    f"body_skin_soft: body skin Weber hp3 ratio {weber_hp3_ratio:.2f} (< {warn_hp3}); verify 1:1 limb & torso contours"
+                )
+            if triggered_body_soft:
+                loss_b = np.clip(
+                    1.0 - cv2.GaussianBlur(np.abs(rel_hp3), (0, 0), 16.0) / np.maximum(cv2.GaussianBlur(np.abs(rel_rhp3), (0, 0), 16.0), 1e-4),
+                    0.0,
+                    1.0,
+                )
+                hotspots += [("body_mush", v, x, y) for v, x, y in _top_peaks(np.where(smask, loss_b, 0.0), 2, 0.0, 260)]
+
+    # 5d-3. Mask sanity check (garment leaks outside subject alpha & unclaimed Swiss-cheese interior holes)
+    if args.garment_mask:
+        g_raw = _read_gray_f32(Path(args.garment_mask).resolve(), (h, w))
+        g_bin = (g_raw >= 0.5).astype(np.uint8)
+        sanity_rec: dict[str, Any] = {}
+        sa_chk = _read_alpha_or_gray_f32(Path(args.subject_alpha).resolve(), (h, w)) if args.subject_alpha else None
+        if sa_chk is not None:
+            leak_mask = (g_raw >= 0.5) & (sa_chk < 0.05)
+            leak_px = int(leak_mask.sum())
+            sanity_rec["garment_leak_outside_alpha_px"] = leak_px
+            if leak_px > 250:
+                failures.append(f"garment_mask_leak_outside_alpha: {leak_px} px of garment mask extend outside subject_alpha (< 0.05)")
+                hotspots += [("mask_leak", v, x, y) for v, x, y in _top_peaks(leak_mask.astype(np.float32), 1, 8.0, 260)]
+        inv_g = (1 - g_bin).astype(np.uint8)
+        n_ih, lbl_ih, st_ih, _ = cv2.connectedComponentsWithStats(inv_g, connectivity=4)
+        border_lbls = set(int(v) for v in np.unique(np.concatenate([lbl_ih[0, :], lbl_ih[-1, :], lbl_ih[:, 0], lbl_ih[:, -1]])))
+        swiss_ids: list[int] = []
+        swiss_px = 0
+        for cid in range(1, n_ih):
+            if cid in border_lbls:
+                continue
+            area_h = int(st_ih[cid, cv2.CC_STAT_AREA])
+            if not (200 <= area_h <= 80000):
+                continue
+            x_h, y_h, w_h, h_h = [int(st_ih[cid, k]) for k in (cv2.CC_STAT_LEFT, cv2.CC_STAT_TOP, cv2.CC_STAT_WIDTH, cv2.CC_STAT_HEIGHT)]
+            roi_lbl = lbl_ih[y_h:y_h + h_h, x_h:x_h + w_h] == cid
+            if skin_raw is not None:
+                skin_frac = float((skin_raw[y_h:y_h + h_h, x_h:x_h + w_h][roi_lbl] >= 0.35).mean())
+                if skin_frac >= 0.55:
+                    continue
+            if sa_chk is not None:
+                sa_frac = float((sa_chk[y_h:y_h + h_h, x_h:x_h + w_h][roi_lbl] >= 0.5).mean())
+                if sa_frac < 0.50:
+                    continue
+            swiss_ids.append(cid)
+            swiss_px += area_h
+        sanity_rec["swiss_hole_count"] = len(swiss_ids)
+        sanity_rec["swiss_hole_px"] = swiss_px
+        checks["mask_sanity_check"] = sanity_rec
+        if swiss_px >= 1500:
+            audit_warnings.append(f"garment_mask_swiss_cheese_holes: {len(swiss_ids)} unclaimed interior holes ({swiss_px} px)")
+            if swiss_px >= 8000:
+                hole_map = np.isin(lbl_ih, swiss_ids).astype(np.float32)
+                hotspots += [("mask_hole", v, x, y) for v, x, y in _top_peaks(hole_map, 1, 12.0, 260)]
+
     # 5e. Auto hotspot 1:1 review crops at the worst places the checks found (not fixed boxes)
     review_crops: dict[str, str] = {}
     if hotspots:
@@ -2067,6 +2167,38 @@ def cmd_hair_paint(args: argparse.Namespace) -> int:
         intensity=args.intensity,
         seed=int(args.seed),
         overwrite=args.overwrite,
+    )
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_hair_sculpt(args: argparse.Namespace) -> int:
+    from hair_sculpt_ops import run_hair_sculpt
+
+    payload = run_hair_sculpt(
+        subject_rgba_path=Path(args.subject_rgba).resolve(),
+        hair_mask_path=Path(args.hair_mask).resolve(),
+        out_dir=Path(args.out_dir).resolve(),
+        bg_path=Path(args.bg).resolve() if args.bg else None,
+        occluder_mask_path=Path(args.occluder_mask).resolve() if args.occluder_mask else None,
+        face_mask_path=Path(args.face_mask).resolve() if args.face_mask else None,
+        eyes_brows_mask_path=Path(args.eyes_brows_mask).resolve() if args.eyes_brows_mask else None,
+        clothes_mask_path=Path(args.clothes_mask).resolve() if args.clothes_mask else None,
+        accessories_mask_path=Path(args.accessories_mask).resolve() if args.accessories_mask else None,
+        arms_mask_path=Path(args.arms_mask).resolve() if args.arms_mask else None,
+        style=str(args.style),
+        boldness=str(args.boldness),
+        wind_dir=str(args.wind_dir),
+        rim_color=args.rim_color,
+        ambient_color=args.ambient_color,
+        key_side=str(args.key_side),
+        engine=str(args.engine),
+        reshape=bool(args.reshape),
+        trim_stiff_ends=bool(args.trim_stiff_ends),
+        samples=int(args.samples),
+        render_scale=float(args.render_scale),
+        seed=int(args.seed),
+        overwrite=bool(args.overwrite),
     )
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0
@@ -2201,6 +2333,7 @@ def cmd_tile_refine(args: argparse.Namespace) -> int:
 
 
 def cmd_cutout_refine(args: argparse.Namespace) -> int:
+    _ensure_cuda_dlls()
     from cutout_refine_ops import run_cutout_refine
 
     payload = run_cutout_refine(
@@ -2247,7 +2380,17 @@ def cmd_makeup_paint(args: argparse.Namespace) -> int:
         pc_exe=str(PHOTOCRAFT_CLI),
         face_task_path=MEDIAPIPE_FACE_TASK,
         faces_json_path=Path(args.faces_json).resolve() if args.faces_json else None,
+        face_parse_dir=Path(args.face_parse_dir).resolve() if args.face_parse_dir else None,
+        style=str(args.style),
         intensity=float(args.intensity),
+        iris_color=args.iris_color,
+        lip_tone=args.lip_tone,
+        eyeshadow_tone=args.eyeshadow_tone,
+        blush_tone=args.blush_tone,
+        lash_mode=str(args.lash_mode),
+        aegyo_sal=float(args.aegyo_sal) if args.aegyo_sal is not None else None,
+        skip_nose_db=bool(args.skip_nose_db),
+        build_pcraft=bool(args.build_pcraft),
         overwrite=args.overwrite,
     )
     print(json.dumps(payload, indent=2, ensure_ascii=False))
@@ -2274,6 +2417,24 @@ def cmd_body_liquify(args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_accent_light_spec(spec: str, width: int | None = None, height: int | None = None) -> dict[str, Any]:
+    parts = [s.strip() for s in spec.split(",")]
+    if len(parts) < 3:
+        raise ValueError(f"Expected x,y,#RRGGBB[,radius[,strength]], got {spec!r}")
+    xv = float(parts[0])
+    yv = float(parts[1])
+    x_frac = xv / float(width) if (abs(xv) > 1.5 and width) else xv
+    y_frac = yv / float(height) if (abs(yv) > 1.5 and height) else yv
+    hx = parts[2].lstrip("#")
+    if len(hx) != 6:
+        raise ValueError(f"Expected #RRGGBB in accent light, got {parts[2]!r}")
+    rgb = [round(int(hx[i : i + 2], 16) / 255.0, 4) for i in (0, 2, 4)]
+    rad = float(parts[3]) if len(parts) >= 4 else 0.35
+    rad_frac = rad / float(width) if (rad > 2.0 and width) else rad
+    st = float(parts[4]) if len(parts) >= 5 else 0.65
+    return {"x_frac": x_frac, "y_frac": y_frac, "z": 0.20, "rgb": rgb, "radius_frac": rad_frac, "strength": st, "source": "cli"}
+
+
 def cmd_vfx_overlay(args: argparse.Namespace) -> int:
     from vfx_overlay_ops import run_vfx_overlay
 
@@ -2284,6 +2445,10 @@ def cmd_vfx_overlay(args: argparse.Namespace) -> int:
         height=int(args.height),
         out_dir=Path(args.out_dir).resolve(),
         subject_alpha_path=Path(args.subject_alpha).resolve() if args.subject_alpha else None,
+        fg_rgba_path=Path(args.fg_rgba).resolve() if args.fg_rgba else None,
+        normal_map_path=Path(args.normal_map).resolve() if args.normal_map else None,
+        garment_mask_path=Path(args.garment_mask).resolve() if args.garment_mask else None,
+        bg_path=Path(args.bg).resolve() if args.bg else None,
         face_parse_dir=Path(args.face_parse_dir).resolve() if args.face_parse_dir else None,
         title_box_xywh=tbox,
         placement=args.placement,
@@ -2291,6 +2456,8 @@ def cmd_vfx_overlay(args: argparse.Namespace) -> int:
         tint_hex=args.tint_hex,
         tint_strength=float(args.tint_strength),
         spill_strength=float(args.spill_strength),
+        causal_strength=float(args.causal_strength),
+        env_spill_strength=float(args.env_spill_strength),
         subject_front_keep=float(args.subject_front_keep),
         density_gamma=float(args.density_gamma),
         haze_suppress=float(args.haze_suppress),
@@ -2304,12 +2471,25 @@ def cmd_vfx_overlay(args: argparse.Namespace) -> int:
 
 
 def cmd_relight_sculpt(args: argparse.Namespace) -> int:
+    _ensure_cuda_dlls()
     from relight_cinema_ops import run_relight_sculpt
 
     if not DEPTH_ANYTHING_V2_SMALL_MODEL.exists():
         raise FileNotFoundError(f"Depth-Anything-V2-Small model missing: {DEPTH_ANYTHING_V2_SMALL_MODEL}. Run download_models.py core.")
+
+    fg_p = Path(args.fg_rgba).resolve()
+    acc_lights: list[dict[str, Any]] = []
+    if args.lights_json:
+        acc_lights.extend(json.loads(Path(args.lights_json).resolve().read_text(encoding="utf-8")))
+    if args.accent_light:
+        from PIL import Image
+        with Image.open(fg_p) as im_sz:
+            fw, fh = im_sz.size
+        for sp in args.accent_light:
+            acc_lights.append(_parse_accent_light_spec(sp, fw, fh))
+
     payload = run_relight_sculpt(
-        fg_rgba_path=Path(args.fg_rgba).resolve(),
+        fg_rgba_path=fg_p,
         depth_model_path=DEPTH_ANYTHING_V2_SMALL_MODEL,
         out_dir=Path(args.out_dir).resolve(),
         bg_path=Path(args.bg).resolve() if args.bg else None,
@@ -2317,6 +2497,12 @@ def cmd_relight_sculpt(args: argparse.Namespace) -> int:
         scene_meta_path=Path(args.scene_meta).resolve() if args.scene_meta else None,
         face_parse_dir=Path(args.face_parse_dir).resolve() if args.face_parse_dir else None,
         body_parse_dir=Path(args.body_parse_dir).resolve() if args.body_parse_dir else None,
+        garment_mask_path=Path(args.garment_mask).resolve() if args.garment_mask else None,
+        skin_mask_path=Path(args.skin_mask).resolve() if args.skin_mask else None,
+        delight_strength=float(args.delight_strength),
+        delight_floor_l=float(args.delight_floor),
+        accent_lights=acc_lights if acc_lights else None,
+        auto_bg_lights=not bool(args.no_auto_bg_lights),
         shadow_strength=float(args.shadow_strength),
         key_strength=float(args.key_strength),
         rim_strength=float(args.rim_strength),
@@ -2389,7 +2575,42 @@ def _find_blender_exe() -> Path:
     raise FileNotFoundError("blender.exe not found; set BLENDER_EXE environment variable.")
 
 
+def cmd_handoff_pack(args: argparse.Namespace) -> int:
+    from handoff_ops import run_handoff_pack
+
+    pline = None
+    if args.prop_line:
+        vals = [float(x.strip()) for x in args.prop_line.split(",")]
+        if len(vals) != 4:
+            raise ValueError(f"--prop-line expects x0,y0,x1,y1 (normalized 0..1), got {args.prop_line!r}")
+        pline = (vals[0], vals[1], vals[2], vals[3])
+    payload = run_handoff_pack(
+        out_dir=Path(args.out_dir).resolve(),
+        project_name=str(args.project_name),
+        character=str(args.character),
+        whitemodel_path=Path(args.whitemodel).resolve() if args.whitemodel else None,
+        subject_rgba_path=Path(args.subject_rgba).resolve() if args.subject_rgba else None,
+        scene_meta_path=Path(args.scene_meta).resolve() if args.scene_meta else None,
+        preset=args.preset,
+        bg_prompt_cn=str(args.bg_prompt_cn),
+        bg_prompt_en=str(args.bg_prompt_en),
+        vfx_prompt_cn=str(args.vfx_prompt_cn),
+        vfx_prompt_en=str(args.vfx_prompt_en),
+        aspect=str(args.aspect),
+        target_width=int(args.target_width),
+        target_height=int(args.target_height),
+        key_light_side=str(args.key_light_side),
+        subject_x_frac=float(args.subject_x_frac),
+        prop_line_norm=pline,
+        overwrite=args.overwrite,
+    )
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
 def cmd_scene_whitemodel(args: argparse.Namespace) -> int:
+    from handoff_ops import run_handoff_pack
+
     blender = _find_blender_exe()
     out_d = Path(args.out_dir).resolve()
     out_d.mkdir(parents=True, exist_ok=True)
@@ -2416,7 +2637,51 @@ def cmd_scene_whitemodel(args: argparse.Namespace) -> int:
     if proc.returncode != 0:
         raise RuntimeError(f"Blender scene-whitemodel failed (rc={proc.returncode}): {proc.stderr[-800:] or proc.stdout[-800:]}")
     meta_p = out_d / "scene_meta.json"
-    print(meta_p.read_text(encoding="utf-8"))
+    meta_obj = json.loads(meta_p.read_text(encoding="utf-8"))
+    handoff = run_handoff_pack(
+        out_dir=out_d,
+        project_name=out_d.name,
+        whitemodel_path=out_d / "01_blender_whitemodel_empty.png",
+        subject_rgba_path=Path(args.subject_rgba).resolve() if args.subject_rgba else None,
+        scene_meta_path=meta_p,
+        preset=args.preset,
+        aspect=args.aspect,
+        target_width=3840 if args.aspect == "16:9" else (2160 if args.aspect == "9:16" else 4096),
+        target_height=2160 if args.aspect == "16:9" else (3840 if args.aspect == "9:16" else 1714),
+        subject_x_frac=float(args.subject_x_frac),
+        overwrite=True,
+    )
+    meta_obj["status"] = handoff["status"]
+    meta_obj["allow_agent_self_gen"] = False
+    meta_obj["outputs"]["handoff_md"] = handoff["outputs"]["handoff_md"]
+    meta_obj["outputs"]["handoff_manifest"] = handoff["outputs"]["handoff_manifest"]
+    meta_obj["outputs"]["layout_guide"] = handoff["outputs"]["layout_guide"]
+    print(json.dumps(meta_obj, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_output_sharpen(args: argparse.Namespace) -> int:
+    from output_sharpen_ops import run_output_sharpen
+
+    payload = run_output_sharpen(
+        input_path=Path(args.input).resolve(),
+        out_dir=Path(args.out_dir).resolve(),
+        style=str(args.style),
+        strength=args.strength,
+        radius=args.radius,
+        iterations=int(args.iterations),
+        bg_strength=args.bg_strength,
+        subject_alpha=Path(args.subject_alpha).resolve() if args.subject_alpha else None,
+        eyes_mask=Path(args.eyes_mask).resolve() if args.eyes_mask else None,
+        lips_mask=Path(args.lips_mask).resolve() if args.lips_mask else None,
+        hair_mask=Path(args.hair_mask).resolve() if args.hair_mask else None,
+        garment_mask=Path(args.garment_mask).resolve() if args.garment_mask else None,
+        skin_mask=Path(args.skin_mask).resolve() if args.skin_mask else None,
+        face_skin_mask=Path(args.face_skin_mask).resolve() if args.face_skin_mask else None,
+        blend_mode=str(args.blend_mode),
+        overwrite=bool(args.overwrite),
+    )
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -2458,6 +2723,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_ma.add_argument("--protected-mask", help="Canonical non-hair body/garment mask PNG (e.g. mask_protected_body.png)")
     p_ma.add_argument("--trim-mask", help="Subject trim mask PNG (e.g. 04a_subject_4k_hair_trim_mask.png)")
     p_ma.add_argument("--garment-mask", help="Single garment mask PNG for tone-jump check (e.g. mask_skirt_dress.png)")
+    p_ma.add_argument("--skin-mask", help="Whole-body skin mask PNG for body micro-contrast & clarity retention check vs --reference")
+    p_ma.add_argument("--face-skin-mask", help="Optional face-only skin mask PNG to exclude face when measuring body-only skin clarity")
     p_ma.add_argument("--hair-alpha", help="Resculpted hair RGBA or grayscale alpha PNG")
     p_ma.add_argument("--native-hair-mask", help="SegFormer hair mask for real-first runs without external hair cutout")
     p_ma.add_argument("--eyes-brows-mask", help="Transformed eyes & brows mask PNG")
@@ -2631,6 +2898,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_hp.add_argument("--overwrite", action="store_true")
     p_hp.set_defaults(func=cmd_hair_paint)
 
+    p_hs = sub.add_parser("hair-sculpt", help="Whole-head anime hair sculpt via Rigid MLS + v11 analytical micro-clustered strands (optional tutorial-rake / blender)")
+    p_hs.add_argument("--subject-rgba", required=True, help="4K RGBA subject cutout PNG")
+    p_hs.add_argument("--hair-mask", required=True, help="Hair grayscale mask PNG")
+    p_hs.add_argument("--bg", help="Optional aligned background RGB PNG for key/rim/ambient color extraction")
+    p_hs.add_argument("--occluder-mask", help="Optional arms+face occluder mask PNG")
+    p_hs.add_argument("--face-mask", help="Optional face skin mask PNG")
+    p_hs.add_argument("--eyes-brows-mask", help="Optional eyes+brows mask PNG")
+    p_hs.add_argument("--clothes-mask", help="Optional clothes mask PNG")
+    p_hs.add_argument("--accessories-mask", help="Optional accessories/headwear mask PNG")
+    p_hs.add_argument("--arms-mask", help="Optional arms/hands mask PNG")
+    p_hs.add_argument("--style", default="auto", choices=["auto", "long-cascade", "twintails", "short-braids-wispy", "wind-dramatic"])
+    p_hs.add_argument("--boldness", default="medium", choices=["natural", "medium", "dramatic"])
+    p_hs.add_argument("--wind-dir", default="auto", choices=["auto", "left", "right", "down-left", "down-right"])
+    p_hs.add_argument("--rim-color", help="Optional hex rim backlight color, e.g. #9eeeff")
+    p_hs.add_argument("--ambient-color", help="Optional hex shadow ambient tint (hidden color), e.g. #4b3878")
+    p_hs.add_argument("--key-side", default="auto", choices=["auto", "left", "right"])
+    p_hs.add_argument("--engine", default="anime-sculpt", choices=["anime-sculpt", "tutorial-rake", "blender"], help="anime-sculpt (default v11 whole-head Rigid MLS + subpixel analytical micro-clustered strands), tutorial-rake, or blender")
+    p_hs.add_argument("--reshape", action=argparse.BooleanOptionalAction, default=True)
+    p_hs.add_argument("--trim-stiff-ends", action="store_true")
+    p_hs.add_argument("--samples", type=int, default=44)
+    p_hs.add_argument("--render-scale", type=float, default=0.80)
+    p_hs.add_argument("--seed", type=int, default=42)
+    p_hs.add_argument("--out-dir", required=True)
+    p_hs.add_argument("--overwrite", action="store_true")
+    p_hs.set_defaults(func=cmd_hair_sculpt)
+
     p_gr = sub.add_parser("garment-retouch", help="Material-aware CIE Lab frequency separation & luminance dehaze for garments")
     p_gr.add_argument("input", help="Input RGB or RGBA PNG")
     p_gr.add_argument("--garment-mask", help="Single garment grayscale mask PNG")
@@ -2734,10 +3027,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_sfs.add_argument("--overwrite", action="store_true")
     p_sfs.set_defaults(func=cmd_skin_fs)
 
-    p_mp = sub.add_parser("makeup-paint", help="Pure PC PhotoCraft hand-painted makeup layers via 478 MediaPipe landmarks")
+    p_mp = sub.add_parser("makeup-paint", help="Pure PC PhotoCraft optical multi-blend + Blend-If makeup layers v2 via 478 MediaPipe landmarks")
     p_mp.add_argument("input")
     p_mp.add_argument("--faces-json", help="Optional faces.json fallback")
+    p_mp.add_argument("--face-parse-dir", help="Optional BiSeNet face_parse dir (mask_skin/mask_lips/mask_hair_head)")
+    p_mp.add_argument("--style", default="natural", choices=["natural", "editorial", "cos-anime", "painterly"])
     p_mp.add_argument("--intensity", type=float, default=0.72)
+    p_mp.add_argument("--iris-color", default=None, help="Optional #rrggbb or preset: keep|garnet|ruby-dark|violet|amber|emerald|sapphire")
+    p_mp.add_argument("--lip-tone", default="auto", help="Optional #rrggbb or preset: auto|mlbb|dusty-rose|berry-wine|peach-nude|crimson-velvet")
+    p_mp.add_argument("--eyeshadow-tone", default="auto", help="Optional #rrggbb or preset: auto|taupe|rosewood|smoky-plum|peach-brown")
+    p_mp.add_argument("--blush-tone", default="auto", help="Optional #rrggbb or preset: auto|soft-rose|muted-peach|cool-berry")
+    p_mp.add_argument("--lash-mode", default="auto", choices=["auto", "enhance", "subtle-wisp"])
+    p_mp.add_argument("--aegyo-sal", type=float, default=None, help="Optional override 0.0..1.0")
+    p_mp.add_argument("--skip-nose-db", action="store_true")
+    p_mp.add_argument("--build-pcraft", action="store_true", help="Also build standalone makeup_layers.pcraft via PhotoCraft CLI")
     p_mp.add_argument("--out-dir", required=True)
     p_mp.add_argument("--overwrite", action="store_true")
     p_mp.set_defaults(func=cmd_makeup_paint)
@@ -2754,11 +3057,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_bl.add_argument("--overwrite", action="store_true")
     p_bl.set_defaults(func=cmd_body_liquify)
 
-    p_vx = sub.add_parser("vfx-overlay", help="Optical Unmult + face/title avoidance for black-bg AI VFX overlays")
+    p_vx = sub.add_parser("vfx-overlay", help="Optical Unmult + 2.5D normal causal spill + face/title avoidance for black-bg AI VFX overlays")
     p_vx.add_argument("--vfx", required=True, help="Black-background VFX image path")
     p_vx.add_argument("--width", type=int, default=3840)
     p_vx.add_argument("--height", type=int, default=2160)
     p_vx.add_argument("--subject-alpha", help="Optional 4K subject matte PNG for edge light spill")
+    p_vx.add_argument("--fg-rgba", help="Optional 4K subject RGBA PNG for specular luminance gating & preview")
+    p_vx.add_argument("--normal-map", help="Optional Depth-Anything-V2 normal_map_rgb.png for 2.5D causal VFX spill")
+    p_vx.add_argument("--garment-mask", help="Optional dark garment mask PNG to guard matte cloth interiors")
+    p_vx.add_argument("--bg", help="Optional 4K background PNG for nearby surface VFX bounce weighting")
     p_vx.add_argument("--face-parse-dir", help="Optional warped 4K face-parse dir for zero eye/face occlusion")
     p_vx.add_argument("--title-box", help="Optional x,y,w,h poster title safe box")
     p_vx.add_argument("--placement", default="auto-split", choices=["auto-split", "front", "behind"])
@@ -2766,6 +3073,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_vx.add_argument("--tint-hex")
     p_vx.add_argument("--tint-strength", type=float, default=0.20)
     p_vx.add_argument("--spill-strength", type=float, default=0.25)
+    p_vx.add_argument("--causal-strength", type=float, default=0.75)
+    p_vx.add_argument("--env-spill-strength", type=float, default=0.40)
     p_vx.add_argument("--subject-front-keep", type=float, default=0.10)
     p_vx.add_argument("--density-gamma", type=float, default=1.40)
     p_vx.add_argument("--haze-suppress", type=float, default=0.45)
@@ -2776,7 +3085,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_vx.add_argument("--overwrite", action="store_true")
     p_vx.set_defaults(func=cmd_vfx_overlay)
 
-    p_sw = sub.add_parser("scene-whitemodel", help="Parameterized Blender GPU white-model scene kit + Z-depth & prompts")
+    p_sw = sub.add_parser("scene-whitemodel", help="Parameterized Blender GPU white-model scene kit + Z-depth + auto handoff-pack")
     p_sw.add_argument("--preset", default="crystal-conservatory", choices=["crystal-conservatory", "european-arcade", "seaside-stage", "rooftop-twilight", "eastern-pavilion", "studio-cyclorama"])
     p_sw.add_argument("--aspect", default="16:9", choices=["16:9", "9:16", "2.39:1"])
     p_sw.add_argument("--width", type=int, default=1920)
@@ -2790,13 +3099,41 @@ def build_parser() -> argparse.ArgumentParser:
     p_sw.add_argument("--out-dir", required=True)
     p_sw.set_defaults(func=cmd_scene_whitemodel)
 
-    p_rs = sub.add_parser("relight-sculpt", help="2.5D Depth-Anything-V2 volumetric relighting (4 PhotoCraft layers, zero pixel regen)")
+    p_hp = sub.add_parser("handoff-pack", help="Generate hard-stop user handoff card (HANDOFF_FOR_USER.md, manifest, layout guide)")
+    p_hp.add_argument("--out-dir", required=True)
+    p_hp.add_argument("--project-name", default="COS_Project")
+    p_hp.add_argument("--character", default="")
+    p_hp.add_argument("--whitemodel", help="Empty white-model PNG path")
+    p_hp.add_argument("--subject-rgba", help="Optional subject RGBA cutout for layout guide preview")
+    p_hp.add_argument("--scene-meta", help="Optional scene_meta.json")
+    p_hp.add_argument("--preset", default=None)
+    p_hp.add_argument("--bg-prompt-cn", default="")
+    p_hp.add_argument("--bg-prompt-en", default="")
+    p_hp.add_argument("--vfx-prompt-cn", default="")
+    p_hp.add_argument("--vfx-prompt-en", default="")
+    p_hp.add_argument("--aspect", default="16:9")
+    p_hp.add_argument("--target-width", type=int, default=3840)
+    p_hp.add_argument("--target-height", type=int, default=2160)
+    p_hp.add_argument("--key-light-side", default="auto")
+    p_hp.add_argument("--subject-x-frac", type=float, default=0.50)
+    p_hp.add_argument("--prop-line", help="Optional normalized support line x0,y0,x1,y1")
+    p_hp.add_argument("--overwrite", action="store_true")
+    p_hp.set_defaults(func=cmd_handoff_pack)
+
+    p_rs = sub.add_parser("relight-sculpt", help="2.5D Depth-Anything-V2 indoor de-lighting, multi-light accent & volumetric relighting")
     p_rs.add_argument("--fg-rgba", required=True, help="RGBA subject cutout PNG")
-    p_rs.add_argument("--bg", help="Aligned background RGB PNG for key/shadow/floor color sampling")
+    p_rs.add_argument("--bg", help="Aligned background RGB PNG for key/shadow/floor & accent light sampling")
     p_rs.add_argument("--sun-side", default="auto", choices=["auto", "right", "left", "top-right", "top-left", "back"])
     p_rs.add_argument("--scene-meta", help="Optional scene_meta.json")
-    p_rs.add_argument("--face-parse-dir", help="Optional face-parse dir for eye/inner-face protection")
+    p_rs.add_argument("--face-parse-dir", help="Optional face-parse dir for eye/inner-face protection & nose normal smoothing")
     p_rs.add_argument("--body-parse-dir", help="Optional body-parse dir for hair rim enhancement")
+    p_rs.add_argument("--garment-mask", help="Optional dark garment mask PNG for de-yellowing & specular gating")
+    p_rs.add_argument("--skin-mask", help="Optional skin mask PNG for anti-zombie warm chroma floor")
+    p_rs.add_argument("--delight-strength", type=float, default=0.65)
+    p_rs.add_argument("--delight-floor", type=float, default=42.0)
+    p_rs.add_argument("--accent-light", action="append", help="Repeatable accent light x,y,#RRGGBB[,radius[,strength]]")
+    p_rs.add_argument("--lights-json", help="Optional JSON list of accent lights")
+    p_rs.add_argument("--no-auto-bg-lights", action="store_true")
     p_rs.add_argument("--shadow-strength", type=float, default=0.58)
     p_rs.add_argument("--key-strength", type=float, default=0.45)
     p_rs.add_argument("--rim-strength", type=float, default=0.52)
@@ -2831,6 +3168,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_fv.add_argument("--out-dir", required=True)
     p_fv.add_argument("--overwrite", action="store_true")
     p_fv.set_defaults(func=cmd_fg_vfx_3d)
+
+    p_os = sub.add_parser("output-sharpen", help="Halo-free linear-light RL deconvolution + 4-tier semantic focus output sharpening")
+    p_os.add_argument("input", help="Pre-grain flattened RGB composite PNG")
+    p_os.add_argument("--out-dir", required=True)
+    p_os.add_argument("--style", default="photo", choices=["photo", "painterly"])
+    p_os.add_argument("--strength", type=float, default=None)
+    p_os.add_argument("--radius", type=float, default=None)
+    p_os.add_argument("--iterations", type=int, default=8)
+    p_os.add_argument("--bg-strength", type=float, default=None)
+    p_os.add_argument("--subject-alpha")
+    p_os.add_argument("--eyes-mask")
+    p_os.add_argument("--lips-mask")
+    p_os.add_argument("--hair-mask")
+    p_os.add_argument("--garment-mask")
+    p_os.add_argument("--skin-mask")
+    p_os.add_argument("--face-skin-mask")
+    p_os.add_argument("--blend-mode", default="Linear Light", choices=["Linear Light", "Luminosity"])
+    p_os.add_argument("--overwrite", action="store_true")
+    p_os.set_defaults(func=cmd_output_sharpen)
 
     return p
 

@@ -64,7 +64,7 @@ def run_face_restore(
     nostril_clean: bool = True,
     overwrite: bool = False,
 ) -> dict[str, Any]:
-    import onnxruntime as ort
+    from cuda_env import create_onnx_session
     from uniface import RetinaFace, set_cache_dir  # type: ignore
 
     in_path = input_path.resolve()
@@ -100,12 +100,7 @@ def run_face_restore(
             "warning": "no_face_detected",
         }
 
-    avail = ort.get_available_providers()
-    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if "CUDAExecutionProvider" in avail else ["CPUExecutionProvider"]
-    try:
-        sess = ort.InferenceSession(str(model_path), providers=providers)
-    except Exception:
-        sess = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+    sess = create_onnx_session(model_path)
     used_provider = sess.get_providers()[0] if sess.get_providers() else "unknown"
     in_name = sess.get_inputs()[0].name
     out_name = sess.get_outputs()[0].name

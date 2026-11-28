@@ -24,6 +24,131 @@ LUT_PRESETS = (
 )
 
 
+def _J(obj: object) -> str:
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+
+
+def _point_light_field(
+    xx: np.ndarray,
+    yy: np.ndarray,
+    nx: np.ndarray,
+    ny: np.ndarray,
+    nz: np.ndarray,
+    lx: float,
+    ly: float,
+    lz: float,
+    radius: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (ndotl [0..1], Gaussian spatial falloff [0..1]) toward a 3D scene point light."""
+    span = max(1.0, float(xx.shape[1]) * 0.26)
+    dx = (lx - xx) / span
+    dy = (ly - yy) / span
+    dz = np.full_like(dx, lz)
+    inv_d = 1.0 / np.maximum(np.sqrt(dx * dx + dy * dy + dz * dz), 1e-4)
+    ndotl = np.clip((nx * dx + ny * dy + nz * dz) * inv_d, 0.0, 1.0)
+    dist2d = np.hypot(xx - lx, yy - ly)
+    falloff = np.exp(-0.5 * (dist2d / max(32.0, radius)) ** 2)
+    return ndotl, falloff
+
+
+def _detect_bg_accent_lights(bg01: np.ndarray, alpha01: np.ndarray, key_side: str) -> list[dict[str, Any]]:
+    """Auto-extract up to 2 vibrant chromatic accent lights (e.g. neon signs/lamps) from background pixels."""
+    from workbench_ops import rgb255_to_lab
+
+    h, w = bg01.shape[:2]
+    sw = 320
+    sh = max(64, int(round(h * sw / max(1, w))))
+    bg_s = cv2.resize(bg01, (sw, sh), interpolation=cv2.INTER_AREA)
+    a_s = cv2.resize(alpha01, (sw, sh), interpolation=cv2.INTER_AREA)
+    lab_s = rgb255_to_lab(np.clip(bg_s * 255.0, 0.0, 255.0))
+    luma = 0.2126 * bg_s[:, :, 0] + 0.7152 * bg_s[:, :, 1] + 0.0722 * bg_s[:, :, 2]
+    chroma = np.hypot(lab_s[:, :, 1], lab_s[:, :, 2])
+
+    score = (
+        np.clip((luma - 0.30) / 0.52, 0.0, 1.0)
+        * np.clip((chroma - 20.0) / 42.0, 0.0, 1.0)
+        * (a_s < 0.20).astype(np.float32)
+    )
+    score = cv2.GaussianBlur(score, (0, 0), 7.0)
+
+    peaks: list[dict[str, Any]] = []
+    work = score.copy()
+    min_sep = max(32.0, sw * 0.28)
+    rad_suppress = int(max(24, min_sep))
+    for _ in range(2):
+        _, mv, _, ml = cv2.minMaxLoc(work)
+        if mv < 0.16:
+            break
+        px, py = int(ml[0]), int(ml[1])
+        x0, x1 = max(0, px - 10), min(sw, px + 11)
+        y0, y1 = max(0, py - 10), min(sh, py + 11)
+        patch = bg_s[y0:y1, x0:x1]
+        p_lum = 0.2126 * patch[:, :, 0] + 0.7152 * patch[:, :, 1] + 0.0722 * patch[:, :, 2]
+        top_p = patch[p_lum >= np.percentile(p_lum, 65)]
+        med_c = np.median(top_p, axis=0) if top_p.size > 0 else np.median(patch.reshape(-1, 3), axis=0)
+        mx = max(float(med_c.max()), 1e-4)
+        col_norm = np.clip(med_c / mx, 0.05, 1.0)
+        # Skip nearly-achromatic gray/moon spots unless distinctly colored (accent light)
+        if float(col_norm.max() - col_norm.min()) >= 0.16:
+            peaks.append({
+                "x_frac": round(px / float(sw), 4),
+                "y_frac": round(py / float(sh), 4),
+                "z": 0.20,
+                "rgb": [round(float(c), 3) for c in col_norm],
+                "radius_frac": 0.36,
+                "strength": round(float(np.clip(0.45 + 0.45 * mv, 0.45, 0.80)), 3),
+                "source": "auto_bg",
+            })
+        cv2.circle(work, (px, py), rad_suppress, 0.0, -1)
+    return peaks
+
+
+def build_relight_pcraft_cmds(
+    meta: dict[str, Any],
+    *,
+    width: int,
+    height: int,
+    base_layer_name: str,
+    clip: bool = True,
+) -> list[str]:
+    """Build PhotoCraft CLI commands placing all 2.5D relight layers cleanly onto base_layer_name."""
+    layers = [l for l in meta.get("layers", []) if Path(l["path"]).exists()]
+    if not layers:
+        return []
+    cmds: list[str] = []
+    prev = base_layer_name
+    for lay in layers:
+        lname = str(lay["layer_name"])
+        blend = str(lay["blend"])
+        op = float(lay.get("opacity", 1.0))
+        fill_op = lay.get("fill_opacity")
+        bif = lay.get("blend_if")
+        cmds += [
+            "--cmd",
+            "layer.select",
+            "--params",
+            _J({"layer": prev}),
+            "--cmd",
+            "file.placeEmbedded",
+            "--params",
+            _J({"path": str(lay["path"]), "fit": False, "smartObject": True, "center": [width / 2.0, height / 2.0]}),
+            "--cmd",
+            "layer.setProps",
+            "--params",
+            _J({"name": lname, "blend": blend, "opacity": round(op, 3), "clipped": bool(clip), "visible": True}),
+        ]
+        bopts: dict[str, Any] = {}
+        if fill_op is not None and int(round(float(fill_op))) < 100:
+            bopts["fillOpacity"] = int(round(float(fill_op)))
+        if bif is not None:
+            bopts["blendIf"] = bif
+        if bopts:
+            cmds += ["--cmd", "layer.layerStyle.blendingOptions", "--params", _J(bopts)]
+        cmds += ["--cmd", "layer.moveTo", "--params", _J({"target": prev, "position": "above"})]
+        prev = lname
+    return cmds
+
+
 def _read_rgb_f32(path: Path) -> np.ndarray:
     return np.array(Image.open(path).convert("RGB"), dtype=np.float32) / 255.0
 
@@ -212,7 +337,7 @@ def _estimate_subject_depth_normals(
     depth_model_path: Path,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Run Depth-Anything-V2-Small ONNX tightly on subject bbox and extract polished 2.5D normals & cavity AO."""
-    import onnxruntime as ort  # type: ignore
+    from cuda_env import create_onnx_session
 
     h, w = alpha01.shape[:2]
     ys, xs = np.nonzero(alpha01 > 0.05)
@@ -235,9 +360,7 @@ def _estimate_subject_depth_normals(
     std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
     chw = np.transpose((rsz - mean) / std, (2, 0, 1))[None, ...].astype(np.float32)
 
-    avail = ort.get_available_providers()
-    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if "CUDAExecutionProvider" in avail else ["CPUExecutionProvider"]
-    sess = ort.InferenceSession(str(depth_model_path), providers=providers)
+    sess = create_onnx_session(depth_model_path)
     inp_name = sess.get_inputs()[0].name
     pred = np.asarray(sess.run(None, {inp_name: chw})[0], dtype=np.float32).squeeze()
     pred_crop = cv2.resize(pred, (cx1 - cx0, cy1 - cy0), interpolation=cv2.INTER_CUBIC)
@@ -309,6 +432,12 @@ def run_relight_sculpt(
     scene_meta_path: Path | None = None,
     face_parse_dir: Path | None = None,
     body_parse_dir: Path | None = None,
+    garment_mask_path: Path | None = None,
+    skin_mask_path: Path | None = None,
+    delight_strength: float = 0.65,
+    delight_floor_l: float = 42.0,
+    accent_lights: list[dict[str, Any]] | None = None,
+    auto_bg_lights: bool = True,
     shadow_strength: float = 0.58,
     key_strength: float = 0.45,
     rim_strength: float = 0.52,
@@ -316,7 +445,9 @@ def run_relight_sculpt(
     face_protect: float = 0.55,
     overwrite: bool = False,
 ) -> dict[str, Any]:
-    """Generate 4 non-destructive PhotoCraft 2.5D relighting layers driven by Depth-Anything-V2-Small normals."""
+    """Pure non-generative 2.5D indoor de-lighting, Depth-Anything-V2 directional sculpt, and multi-source scene accent relighting."""
+    from workbench_ops import lab_to_rgb255, rgb255_to_lab
+
     t0 = time.perf_counter()
     fg_p = fg_rgba_path.resolve()
     out_d = out_dir.resolve()
@@ -329,7 +460,7 @@ def run_relight_sculpt(
     resolved_side = sun_side.lower().strip()
     if resolved_side == "auto" and scene_meta_path is not None and scene_meta_path.exists():
         meta_s = json.loads(scene_meta_path.read_text(encoding="utf-8"))
-        resolved_side = str(meta_s.get("lighting", {}).get("sun_side", "right")).lower()
+        resolved_side = str(meta_s.get("lighting", {}).get("sun_side") or meta_s.get("sun_side") or "right").lower()
     if resolved_side not in {"right", "left", "top-right", "top-left", "back"}:
         resolved_side = "right"
 
@@ -348,13 +479,15 @@ def run_relight_sculpt(
 
     # Sample physical environment light, shadow, and floor colors from background if provided
     key_rgb = np.array([1.0, 0.91, 0.75], dtype=np.float32)
-    shadow_tint = np.array([0.31, 0.39, 0.50], dtype=np.float32)  # Clean cool teal-slate shadow tint
+    shadow_tint = np.array([0.31, 0.39, 0.50], dtype=np.float32)
     floor_rgb = np.array([0.82, 0.88, 0.92], dtype=np.float32)
     bg_blur_wrap = np.broadcast_to(key_rgb, (h, w, 3)).copy()
+    bg01: np.ndarray | None = None
 
     if bg_path is not None and bg_path.exists():
         bg_im = Image.open(bg_path.resolve()).convert("RGB").resize((w, h), Image.Resampling.BILINEAR)
         bg = np.array(bg_im, dtype=np.float32) / 255.0
+        bg01 = bg
         bg_l = 0.2126 * bg[:, :, 0] + 0.7152 * bg[:, :, 1] + 0.0722 * bg[:, :, 2]
         sun_mask = np.ones((h, w), dtype=bool)
         if "right" in resolved_side:
@@ -370,29 +503,44 @@ def run_relight_sculpt(
         lo_px = bg[bg_l <= p20]
         if lo_px.size > 0:
             s_shd = np.median(lo_px, axis=0).astype(np.float32)
-            # Keep shadow tint cleanly cool & never muddy yellow
             s_shd = np.clip(s_shd / max(float(s_shd.mean()), 1e-3) * 0.36, 0.20, 0.52)
             shadow_tint = np.clip(0.45 * s_shd + 0.55 * np.array([0.30, 0.38, 0.49], dtype=np.float32), 0.18, 0.54)
         fl_px = bg[int(h * 0.74) :, :]
         floor_rgb = np.clip(np.median(fl_px.reshape(-1, 3), axis=0).astype(np.float32), 0.45, 1.0)
         bg_blur_wrap = cv2.GaussianBlur(bg, (0, 0), max(22.0, w * 0.010))
 
-    # Build protective masks so center eyes/front face keep luminous appeal while jaw/cheek/arm/skirt get full 4:1 volume
+    # Protective masks for face/eyes/garment/skin
     face_shield = np.zeros((h, w), dtype=np.float32)
+    face_skin_f = np.zeros((h, w), dtype=np.float32)
     eyes_shield = np.zeros((h, w), dtype=np.float32)
     if face_parse_dir is not None and face_parse_dir.exists():
         fs_p = face_parse_dir / "mask_skin.png"
         eb_p = face_parse_dir / "mask_eyes_brows.png"
         if fs_p.exists():
             f_m = _read_gray_f32(fs_p, (w, h))
-            # Erode slightly inward so jaw & outer cheekbones STILL get dramatic 3D contour shadow!
+            face_skin_f = np.clip(cv2.GaussianBlur(f_m, (0, 0), max(8.0, w * 0.004)), 0.0, 1.0)
             f_er = cv2.erode((f_m > 0.35).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(11, int(w * 0.008)) | 1, max(11, int(w * 0.008)) | 1))).astype(np.float32)
             face_shield = cv2.GaussianBlur(f_er, (0, 0), max(12.0, w * 0.006))
         if eb_p.exists():
             e_m = _read_gray_f32(eb_p, (w, h))
             eyes_shield = np.clip(cv2.GaussianBlur(e_m, (0, 0), 8.0), 0.0, 1.0)
 
-    # Side coordinate bias across subject bbox (strengthens macro left-vs-right directional key/shadow coherence)
+    garment_m = _read_gray_f32(garment_mask_path.resolve(), (w, h)) if (garment_mask_path and garment_mask_path.exists()) else np.zeros((h, w), dtype=np.float32)
+    skin_m = _read_gray_f32(skin_mask_path.resolve(), (w, h)) if (skin_mask_path and skin_mask_path.exists()) else face_skin_f.copy()
+    skin_zone = np.clip(np.maximum(skin_m, face_skin_f) * (1.0 - garment_m), 0.0, 1.0)
+    garment_soft = np.clip(cv2.GaussianBlur(garment_m, (0, 0), max(5.0, w * 0.0022)), 0.0, 1.0)
+    k_g_er = max(13, int(round(w * 0.006)) | 1)
+    garment_core = cv2.erode((garment_m > 0.5).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_g_er, k_g_er))).astype(np.float32)
+    garment_core = np.clip(cv2.GaussianBlur(garment_core, (0, 0), max(6.0, w * 0.0025)), 0.0, 1.0)
+
+    # Smooth normals inside face region so Depth-Anything nose ridge never creates harsh stripe shadows
+    n_soft = cv2.GaussianBlur(normals, (0, 0), max(24.0, w * 0.008))
+    n_soft = n_soft / np.maximum(np.sqrt((n_soft * n_soft).sum(axis=2, keepdims=True)), 1e-4)
+    face_norm_w = np.clip(0.75 * face_skin_f, 0.0, 0.82)[:, :, None]
+    normals_eff = normals * (1.0 - face_norm_w) + n_soft * face_norm_w
+    normals_eff = normals_eff / np.maximum(np.sqrt((normals_eff * normals_eff).sum(axis=2, keepdims=True)), 1e-4)
+
+    # Side coordinate bias across subject bbox
     ys, xs = np.nonzero(alpha > 0.1)
     x_min, x_max = float(xs.min()), float(xs.max())
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
@@ -405,47 +553,88 @@ def run_relight_sculpt(
         sun_side_bias = x_rel
     shade_side_bias = 1.0 - sun_side_bias
 
-    # Lambertian shading dot product + macro side term
-    ndotl = normals[:, :, 0] * L[0] + normals[:, :, 1] * L[1] + normals[:, :, 2] * L[2]
+    ndotl = normals_eff[:, :, 0] * L[0] + normals_eff[:, :, 1] * L[1] + normals_eff[:, :, 2] * L[2]
     ndotl_eff = 0.72 * ndotl + 0.28 * (sun_side_bias * 2.0 - 1.0)
 
-    luma_fg = 0.2126 * rgb_f[:, :, 0] + 0.7152 * rgb_f[:, :, 1] + 0.0722 * rgb_f[:, :, 2]
+    # =========================================================================
+    # STEP 0 (Optional De-Light): Frequency-preserving convention-hall flat-flash & yellow-bounce removal
+    # =========================================================================
+    work_rgb = rgb_f.copy()
+    p_delight: Path | None = None
+    dl_s = float(np.clip(delight_strength, 0.0, 1.0))
+    if dl_s > 0.02:
+        lab_fg = rgb255_to_lab(np.clip(rgb_f * 255.0, 0.0, 255.0))
+        sig_dl = max(32.0, w * 0.014)
+        L_lo = cv2.GaussianBlur(lab_fg[:, :, 0], (0, 0), sig_dl)
+        L_hi = lab_fg[:, :, 0] - L_lo
+        shd_geom_dl = _smoothstep(0.45, -0.30, ndotl_eff)
+        shd_macro_dl = _smoothstep(0.28, 0.92, shade_side_bias)
+        dl_w = np.clip(0.68 * shd_geom_dl + 0.32 * shd_macro_dl, 0.0, 1.0)
+        dl_w *= (1.0 - 0.92 * eyes_shield) * np.clip(1.0 - 0.65 * float(face_protect) * face_shield, 0.25, 1.0)
+        excess_l = np.clip((L_lo - float(delight_floor_l)) / 30.0, 0.0, 1.0)
+        pull_l = 15.0 * dl_s * excess_l * dl_w * (1.0 - 0.55 * garment_core)
+        L_new = np.clip((L_lo - pull_l) + L_hi, 1.5, 99.0)
 
-    # LAYER 1: relight_01_volume_shadow_multiply.png (Multiply: RGB blends from white to cool shadow_tint!)
+        a_new = lab_fg[:, :, 1].copy()
+        b_new = lab_fg[:, :, 2].copy()
+        if garment_soft.max() > 0.05:
+            # Strip warm yellow hall ceiling cast on dark garments while keeping neutral/cool sheen
+            b_cln = np.where(b_new > 0.4, np.minimum(b_new, 0.4) - 0.4 * dl_s, b_new)
+            a_cln = np.where(a_new > 1.4, 1.4 + (a_new - 1.4) * (1.0 - 0.65 * dl_s), a_new)
+            a_new = a_new * (1.0 - garment_soft) + a_cln * garment_soft
+            b_new = b_new * (1.0 - garment_soft) + b_cln * garment_soft
+        if skin_zone.max() > 0.05:
+            # Guard warm skin from losing healthy chroma smoothly with zero boolean cliff edges
+            b_new = b_new + np.maximum(0.0, 2.5 - b_new) * 0.65 * skin_zone
+
+        work_rgb = np.clip(lab_to_rgb255(np.dstack([L_new, a_new, b_new])) / 255.0, 0.0, 1.0)
+        p_delight = out_d / "relight_00_delight_base_rgba.png"
+        _write_png(p_delight, np.dstack([work_rgb, alpha]), "RGBA", overwrite=overwrite)
+
+    luma_fg = 0.2126 * work_rgb[:, :, 0] + 0.7152 * work_rgb[:, :, 1] + 0.0722 * work_rgb[:, :, 2]
+    luma_sm = cv2.GaussianBlur(luma_fg, (0, 0), max(5.0, w * 0.002))
+    garment_spec = _smoothstep(0.08, 0.52, luma_sm)
+
+    layer_specs: list[dict[str, Any]] = []
+
+    # LAYER 1: relight_01_volume_shadow_multiply.png (Multiply: clean white outside alpha)
     shade_geom = _smoothstep(0.42, -0.35, ndotl_eff)
     shade_macro = _smoothstep(0.28, 0.92, shade_side_bias) * 0.52
     shade_w = np.clip(0.70 * shade_geom + 0.30 * shade_macro + 0.42 * cavity_ao, 0.0, 1.0)
-    # Mildly protect front eyes & inner face from harsh darkening while preserving cheekbone/jaw/arm 3D turn
-    shade_w *= np.clip(1.0 - float(face_protect) * 0.72 * face_shield, 0.20, 1.0)
-    shade_w *= (1.0 - 0.80 * eyes_shield)
+    shade_w *= np.clip(1.0 - float(face_protect) * 0.75 * face_shield, 0.20, 1.0)
+    shade_w *= (1.0 - 0.84 * eyes_shield) * (1.0 - 0.40 * garment_core)
     s_amt = np.clip(shade_w * float(shadow_strength), 0.0, 0.82) * alpha
     mult_rgb = 1.0 * (1.0 - s_amt[:, :, None]) + shadow_tint[None, None, :] * s_amt[:, :, None]
 
-    # LAYER 2: relight_02_key_highlight_screen.png (Screen: warm sunlit key sculpting)
+    # LAYER 2: relight_02_key_highlight_screen.png (Soft Light neutral-gray lift: preserves micro-contrast & black depth!)
     key_geom = _smoothstep(0.18, 0.85, ndotl_eff) * (1.0 - 0.65 * cavity_ao)
     key_bias = _smoothstep(0.15, 0.82, sun_side_bias)
     hi_guard = 1.0 - np.clip((luma_fg - 0.80) / 0.20, 0.0, 0.85)
-    key_a = np.clip(key_geom * (0.45 + 0.55 * key_bias) * hi_guard * float(key_strength) * alpha, 0.0, 1.0)
-    key_layer_rgb = np.broadcast_to(key_rgb[None, None, :], (h, w, 3)).copy()
+    key_gate = (1.0 - garment_soft) + garment_soft * np.clip(garment_spec * 0.90 + 0.10, 0.0, 1.0)
+    key_a = np.clip(key_geom * (0.45 + 0.55 * key_bias) * hi_guard * key_gate * float(key_strength) * alpha, 0.0, 1.0)
+    key_sl_target = np.clip(0.5 + 0.42 * key_rgb[None, None, :], 0.5, 0.96)
+    key_layer_rgb = 0.5 * (1.0 - key_a[:, :, None]) + key_sl_target * key_a[:, :, None]
 
-    # LAYER 3: relight_03_fresnel_rim_screen.png (Screen: grazing Fresnel rim + optical bg Light Wrap)
-    fresnel = np.power(np.clip(1.0 - normals[:, :, 2], 0.0, 1.0), 1.65)
-    rim_dir = _smoothstep(-0.20, 0.65, normals[:, :, 0] * L[0] + normals[:, :, 1] * L[1] + 0.25)
+    # LAYER 3: relight_03_fresnel_rim_screen.png (Screen: silhouette-gated Fresnel rim, ZERO internal body fog halos!)
+    fresnel = np.power(np.clip(1.0 - normals_eff[:, :, 2], 0.0, 1.0), 1.65)
+    rim_dir = _smoothstep(-0.20, 0.65, normals_eff[:, :, 0] * L[0] + normals_eff[:, :, 1] * L[1] + 0.25)
     fg_u8 = (alpha > 0.25).astype(np.uint8)
     edge_dist = cv2.distanceTransform(fg_u8, cv2.DIST_L2, 5)
     outer_rim = np.exp(-np.square(edge_dist / max(10.0, w * 0.0045))) * alpha
+    outer_rim_med = np.exp(-np.square(edge_dist / max(18.0, w * 0.007))) * alpha
     hair_bonus = 1.0
     if body_parse_dir is not None and (body_parse_dir / "mask_hair.png").exists():
         hm = _read_gray_f32(body_parse_dir / "mask_hair.png", (w, h))
         hair_bonus = 1.0 + 0.45 * hm
-    rim_w = np.clip((0.55 * outer_rim + 0.45 * fresnel) * (0.35 + 0.65 * rim_dir) * hair_bonus * (1.0 - 0.85 * eyes_shield), 0.0, 1.0)
+    rim_garment_guard = 1.0 - 0.82 * garment_core * (1.0 - garment_spec)
+    rim_w = np.clip((0.68 * outer_rim + 0.32 * fresnel * outer_rim_med) * (0.35 + 0.65 * rim_dir) * hair_bonus * rim_garment_guard * (1.0 - 0.88 * eyes_shield), 0.0, 1.0)
     rim_a = np.clip(rim_w * float(rim_strength) * alpha, 0.0, 1.0)
     rim_rgb = np.clip(0.55 * bg_blur_wrap + 0.45 * key_rgb[None, None, :], 0.0, 1.0)
 
-    # LAYER 4: relight_04_floor_bounce_softlight.png (Soft Light: upward reflected bounce on lower & downward planes)
-    down_facing = _smoothstep(-0.05, 0.55, -normals[:, :, 1])
+    # LAYER 4: relight_04_floor_bounce_softlight.png (Soft Light: neutral gray outside alpha)
+    down_facing = _smoothstep(-0.05, 0.55, -normals_eff[:, :, 1])
     low_zone = np.clip((yy - float(ys.min())) / max(1.0, float(ys.max() - ys.min())), 0.0, 1.0)
-    bounce_w = np.clip((0.55 * down_facing + 0.45 * low_zone) * low_zone * float(bounce_strength), 0.0, 0.75) * alpha
+    bounce_w = np.clip((0.55 * down_facing + 0.45 * low_zone) * low_zone * float(bounce_strength) * (1.0 - 0.45 * garment_core), 0.0, 0.72) * alpha
     bounce_rgb = np.broadcast_to(floor_rgb[None, None, :], (h, w, 3)).copy()
 
     p_shd = out_d / "relight_01_volume_shadow_multiply.png"
@@ -458,17 +647,86 @@ def run_relight_sculpt(
     _write_png(p_shd, np.dstack([mult_rgb, alpha]), "RGBA", overwrite=overwrite)
     _write_png(p_key, np.dstack([key_layer_rgb, key_a]), "RGBA", overwrite=overwrite)
     _write_png(p_rim, np.dstack([rim_rgb, rim_a]), "RGBA", overwrite=overwrite)
-    _write_png(p_bnc, np.dstack([bounce_rgb, bounce_w]), "RGBA", overwrite=overwrite)
+    _write_png(p_bnc, np.dstack([np.where(bounce_w[:, :, None] > 0.01, bounce_rgb, 0.5), bounce_w]), "RGBA", overwrite=overwrite)
     _write_png(p_dmap, depth_pol, "L", overwrite=overwrite)
-    _write_png(p_nmap, normals * 0.5 + 0.5, "RGB", overwrite=overwrite)
+    _write_png(p_nmap, normals_eff * 0.5 + 0.5, "RGB", overwrite=overwrite)
 
-    # Simulate physical composite of all 4 relight layers for quick visual & quantitative L/R verification
-    comp = rgb_f * mult_rgb
+    layer_specs.extend([
+        {"key": "volume_shadow", "path": str(p_shd), "layer_name": "01_Relight_Volume_Shadow", "blend": "Multiply", "opacity": 0.72, "fill_opacity": 100, "blend_if": None},
+        {"key": "key_highlight", "path": str(p_key), "layer_name": "02_Relight_Key_Highlight", "blend": "Soft Light", "opacity": 0.65, "fill_opacity": 100, "blend_if": None},
+        {"key": "fresnel_rim", "path": str(p_rim), "layer_name": "03_Relight_Fresnel_Rim", "blend": "Screen", "opacity": 0.42, "fill_opacity": 100, "blend_if": None},
+        {"key": "floor_bounce", "path": str(p_bnc), "layer_name": "04_Relight_Floor_Bounce", "blend": "Soft Light", "opacity": 0.75, "fill_opacity": 100, "blend_if": None},
+    ])
+
+    # =========================================================================
+    # LAYERS 5-7: Scene Multi-Source Accent Lights (auto-extracted from BG or custom) + Dark Garment Neutral Guard
+    # =========================================================================
+    active_accents = list(accent_lights) if accent_lights else (_detect_bg_accent_lights(bg01, alpha, resolved_side) if (auto_bg_lights and bg01 is not None) else [])
+    diff_accum = np.zeros((h, w, 3), dtype=np.float32)
+    spec_accum = np.zeros((h, w, 3), dtype=np.float32)
+
+    if active_accents:
+        diff_gate = (1.0 - garment_soft) + garment_soft * np.clip(garment_spec * 0.85 + outer_rim, 0.0, 1.0) * (1.0 - 0.70 * garment_core)
+        spec_gate = (1.0 - garment_soft) * outer_rim * 0.85 + garment_soft * np.clip(garment_spec * (1.0 - 0.55 * garment_core) + outer_rim * 0.90, 0.0, 1.0)
+        face_eye_d = (1.0 - 0.94 * eyes_shield) * (1.0 - 0.68 * face_shield)
+        face_eye_s = (1.0 - 0.95 * eyes_shield) * (1.0 - 0.82 * face_shield)
+
+        for al in active_accents:
+            lx = float(al["x_frac"]) * float(w)
+            ly = float(al["y_frac"]) * float(h)
+            lz = float(al.get("z", 0.20))
+            rad = float(al.get("radius_frac", 0.35)) * float(w)
+            st = float(al.get("strength", 0.60))
+            col = np.array(al["rgb"], dtype=np.float32)[None, None, :]
+            n_pt, f_pt = _point_light_field(xx, yy, normals_eff[:, :, 0], normals_eff[:, :, 1], normals_eff[:, :, 2], lx, ly, lz, rad)
+
+            d_w = np.clip(n_pt * f_pt * diff_gate * face_eye_d * st * alpha, 0.0, 1.0)
+            s_w = np.clip((0.70 * n_pt + 0.30 * fresnel) * f_pt * spec_gate * face_eye_s * st * alpha, 0.0, 1.0)
+            diff_accum += d_w[:, :, None] * col
+            spec_accum += s_w[:, :, None] * col
+
+    diff_a = np.clip(diff_accum.max(axis=2), 0.0, 1.0)
+    diff_a = np.clip(diff_a / (1.0 + 0.45 * diff_a), 0.0, 1.0)
+    diff_rgb = np.where(diff_a[:, :, None] > 1e-4, np.clip(diff_accum / np.maximum(diff_accum.max(axis=2, keepdims=True), 1e-4), 0.0, 1.0), 0.0)
+
+    spec_a = np.clip(spec_accum.max(axis=2), 0.0, 1.0)
+    spec_a = np.clip(spec_a / (1.0 + 0.55 * spec_a), 0.0, 1.0)
+    spec_rgb = np.where(spec_a[:, :, None] > 1e-4, np.clip(spec_accum / np.maximum(spec_accum.max(axis=2, keepdims=True), 1e-4), 0.0, 1.0), 0.0)
+
+    p_acc_d = out_d / "relight_05_scene_accent_diffuse_screen.png"
+    p_acc_s = out_d / "relight_06_scene_accent_spec_add.png"
+    _write_png(p_acc_d, np.dstack([diff_rgb, diff_a]), "RGBA", overwrite=overwrite)
+    _write_png(p_acc_s, np.dstack([spec_rgb, spec_a]), "RGBA", overwrite=overwrite)
+    if active_accents:
+        layer_specs.extend([
+            {"key": "accent_diffuse", "path": str(p_acc_d), "layer_name": "05_Relight_Accent_Diffuse", "blend": "Screen", "opacity": 0.72, "fill_opacity": 100, "blend_if": None},
+            {"key": "accent_spec", "path": str(p_acc_s), "layer_name": "06_Relight_Accent_Specular", "blend": "Linear Dodge (Add)", "opacity": 0.85, "fill_opacity": 48, "blend_if": None},
+        ])
+
+    p_gcol: Path | None = None
+    if garment_soft.max() > 0.05:
+        p_gcol = out_d / "relight_07_dark_garment_neutral_color.png"
+        g_guard_a = np.clip(garment_core * alpha * (1.0 - 0.60 * garment_spec * spec_a), 0.0, 1.0)
+        _write_png(p_gcol, np.dstack([np.full((h, w, 3), 0.10, dtype=np.float32), g_guard_a]), "RGBA", overwrite=overwrite)
+        layer_specs.append({
+            "key": "garment_neutral_guard",
+            "path": str(p_gcol),
+            "layer_name": "07_Relight_DarkGarment_NeutralGuard",
+            "blend": "Color",
+            "opacity": 0.75,
+            "fill_opacity": 100,
+            "blend_if": None,
+        })
+
+    # Simulate physical composite of de-lit base + all relight layers for visual verification
+    comp = work_rgb * mult_rgb
     comp = 1.0 - (1.0 - comp) * (1.0 - key_layer_rgb * key_a[:, :, None])
     comp = 1.0 - (1.0 - comp) * (1.0 - rim_rgb * rim_a[:, :, None])
-    # Soft light preview blend
     sl = np.where(bounce_rgb <= 0.5, comp - (1.0 - 2.0 * bounce_rgb) * comp * (1.0 - comp), comp + (2.0 * bounce_rgb - 1.0) * (np.sqrt(np.clip(comp, 0.0, 1.0)) - comp))
     comp = np.clip(comp * (1.0 - bounce_w[:, :, None]) + sl * bounce_w[:, :, None], 0.0, 1.0)
+    if active_accents:
+        comp = 1.0 - (1.0 - comp) * (1.0 - diff_rgb * (diff_a[:, :, None] * 0.72))
+        comp = np.clip(comp + spec_rgb * (spec_a[:, :, None] * 0.42), 0.0, 1.0)
 
     def _lr_gap(img01: np.ndarray) -> float:
         lab_t = cv2.cvtColor(np.clip(np.round(img01 * 255.0), 0, 255).astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
@@ -479,10 +737,9 @@ def run_relight_sculpt(
             return 0.0
         return round(float(Lt[m_l].mean() - Lt[m_r].mean()), 2)
 
-    # Save 3-panel comparison (Original Flat | 2.5D Surface Normals | Relit Volumetric Result) over dark studio neutral backdrop
     backdrop = np.array([0.14, 0.16, 0.20], dtype=np.float32)[None, None, :]
     vis_orig = rgb_f * alpha[:, :, None] + backdrop * (1.0 - alpha[:, :, None])
-    vis_norm = (normals * 0.5 + 0.5) * alpha[:, :, None] + backdrop * (1.0 - alpha[:, :, None])
+    vis_norm = (normals_eff * 0.5 + 0.5) * alpha[:, :, None] + backdrop * (1.0 - alpha[:, :, None])
     vis_relit = comp * alpha[:, :, None] + backdrop * (1.0 - alpha[:, :, None])
     bx0, by0, bx1, by1 = max(0, int(xs.min()) - 40), max(0, int(ys.min()) - 40), min(w, int(xs.max()) + 40), min(h, int(ys.max()) + 40)
     cw_p = min(560, bx1 - bx0)
@@ -493,35 +750,59 @@ def run_relight_sculpt(
         panels.append(sub_im.resize((cw_p, ch_p), Image.Resampling.LANCZOS))
     cmp_im = Image.new("RGB", (cw_p * 3 + 48, ch_p + 56), (18, 20, 26))
     dr = ImageDraw.Draw(cmp_im)
-    titles = ("1. Flat Input", "2. 2.5D Normals (DAv2)", f"3. Relit ({resolved_side})")
+    titles = ("1. Convention-Hall Input", "2. 2.5D Normals + Accents", f"3. De-Lit + Relit ({resolved_side})")
     for idx, (pim, ttl) in enumerate(zip(panels, titles)):
         px = 12 + idx * (cw_p + 12)
         dr.text((px, 12), ttl, fill=(230, 236, 245))
         cmp_im.paste(pim, (px, 40))
+    # Annotate accent light directions on Panel 2
+    for al in active_accents:
+        ax_l = float(al["x_frac"]) * float(w)
+        ay_l = float(al["y_frac"]) * float(h)
+        px_m = int(12 + (cw_p + 12) + np.clip((ax_l - bx0) * cw_p / max(1, bx1 - bx0), 8, cw_p - 8))
+        py_m = int(40 + np.clip((ay_l - by0) * ch_p / max(1, by1 - by0), 8, ch_p - 8))
+        mc = tuple(int(c * 255) for c in al["rgb"])
+        dr.ellipse([px_m - 7, py_m - 7, px_m + 7, py_m + 7], fill=mc, outline=(255, 255, 255))
+
     p_cmp = out_d / "relight_compare_preview.png"
     cmp_im.save(p_cmp, "PNG")
 
     fg_solid = alpha > 0.6
     luma_after = 0.2126 * comp[:, :, 0] + 0.7152 * comp[:, :, 1] + 0.0722 * comp[:, :, 2]
-    return {
+    outputs: dict[str, Any] = {
+        "relight_01_volume_shadow_multiply": str(p_shd),
+        "relight_02_key_highlight_screen": str(p_key),
+        "relight_03_fresnel_rim_screen": str(p_rim),
+        "relight_04_floor_bounce_softlight": str(p_bnc),
+        "relight_05_scene_accent_diffuse_screen": str(p_acc_d),
+        "relight_06_scene_accent_spec_add": str(p_acc_s),
+        "depth_map_preview": str(p_dmap),
+        "normal_map_rgb": str(p_nmap),
+        "relight_compare_preview": str(p_cmp),
+    }
+    if p_delight is not None:
+        outputs["relight_00_delight_base_rgba"] = str(p_delight)
+    if p_gcol is not None:
+        outputs["relight_07_dark_garment_neutral_color"] = str(p_gcol)
+
+    res_payload: dict[str, Any] = {
         "ok": True,
         "input": str(fg_p),
         "sun_side": resolved_side,
+        "delight_strength": dl_s,
+        "detected_accent_lights": active_accents,
         "left_minus_right_L_before": _lr_gap(rgb_f),
         "left_minus_right_L_after": _lr_gap(comp),
         "shadow_side_mean_luma_before": round(float(luma_fg[fg_solid].mean()), 3),
         "shadow_side_mean_luma_after": round(float(luma_after[fg_solid].mean()), 3),
         "elapsed_s": round(time.perf_counter() - t0, 2),
-        "outputs": {
-            "relight_01_volume_shadow_multiply": str(p_shd),
-            "relight_02_key_highlight_screen": str(p_key),
-            "relight_03_fresnel_rim_screen": str(p_rim),
-            "relight_04_floor_bounce_softlight": str(p_bnc),
-            "depth_map_preview": str(p_dmap),
-            "normal_map_rgb": str(p_nmap),
-            "relight_compare_preview": str(p_cmp),
-        },
+        "layers": layer_specs,
+        "outputs": outputs,
     }
+    p_meta = out_d / "relight_layers_meta.json"
+    p_meta.write_text(json.dumps(res_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    outputs["relight_layers_meta"] = str(p_meta)
+    return res_payload
 
 
 def _cinema_preset_config(preset: str) -> dict[str, Any]:

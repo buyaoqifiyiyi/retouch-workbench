@@ -104,3 +104,28 @@
    - 在保护眼神与内面通透感的同时压实背光侧颧骨/下颌/手臂/裙褶暗部，与场景光影真正长在同一盏灯下。
 3. **PhotoCraft 原生电影调色收束（`cinema-grade --mode grade`）**：
    - 使用 `layer.newAdjustmentLayer.colorLookup`（`interpolation: "tetrahedral"` 加载 `resources/luts/*.cube` 33³ 标准电影 3D LUT）+ `filter.cameraRaw` 三轮校色 + `colorBalance` 统一把人物与背景阴影收入同组冷青/暖金电影色调；高光微光晕（`Screen`）必须**仅从锚定建筑亮部（`L > 0.88`）单独提取**，严禁把前景粒子雾斑喂进光晕层。
+
+---
+
+## 七、场馆去平光 × 多光源场景解析 × 特效因果局部重打光流程（De-Light × Multi-Light × VFX-Causal Relight）
+
+当原本在漫展场馆平光/棚拍软箱下拍摄的人物放进夜间、霓虹都市、强火光或带有大面积发光特效的场景时，仅靠一层统一冷压暗仍会出现两大假象：**① 背光面肤色和黑衣残留原本场馆平光与天花板黄浊，像贴纸飘在夜景上；② 画面里的特效粒子/光环不会真实照亮人物邻近衣袖、发梢、下颌与周边建筑。** 基于 Nuke 2.5D 交互重打光机理与纯确定性物理，工作台建立三段标准链路（零人物 AI 重绘）：
+
+1. **场馆去平光与暗衣净化（`relight-sculpt --delight-strength 0.65`）**：
+   - 在 CIE Lab 空间按高频锁纹理分离出宽半径室内平光底频 `L_lo` 与真实细节高频 `L_hi`；只对背光面超出夜色基准的过亮平光 `max(L_lo - floor, 0)` 平滑压实，同时保持 `L_hi` 毛孔织纹 100% 完整；
+   - 对 `--skin-mask` 施加热血红黄安全底线（`Lab b* >= 2.5`）防夜色压出灰青僵尸脸；对 `--garment-mask` 洗掉棚顶灯造成的 `b* > 0.4` 暖黄浊气，并平滑人脸区 2.5D 法线消除鼻梁侧陡坡脏线。
+2. **背景多光源自动/手动解析（`relight-sculpt` Layer 5–7）**：
+   - 自动扫描背景（排除主体掩码外）高亮度高彩度彩色聚光灯源（如霓虹灯牌、红伞灯笼、冷青招牌）生成多点 2.5D 点光源漫射与高光层，或由 `--accent-light "x,y,#RRGGBB,radius,strength"` 显式传入多光源；
+   - 深色反光服饰通过亮度平滑斜坡区分漫反射暗面与镜面褶皱峰，仅让高光褶皱与外缘轮廓吃进彩色霓虹高光，再配 `07_dark_garment_neutral_color` 护住背光黑衣中性质感。
+3. **2.5D 法线调制特效因果反光（`vfx-overlay --normal-map ... --fg-rgba ... --garment-mask ... --bg ...`）**：
+   - 借鉴 VFX 交互打光（Nuke Relight / PointLight）原理，对去黑底后的特效能量场做近/中/远三尺度高斯滤波，并求中尺度光场 Sobel 梯度与主体 2.5D 法线点乘（`dot(N_xy, grad_E)`），同步导出三层非破坏光效：
+     - `vfx_causal_broad_spill_screen.png`（`Screen`，Reinhard 滚降防过曝，剪贴于主体）；
+     - `vfx_causal_hot_rim_add.png`（`Linear Dodge (Add)` 配 `fillOpacity ~44`，仅勾近距受光边缘与漆皮/丝绸光泽脊）；
+     - `vfx_causal_env_spill_screen.png`（`Screen`，置于主体下方反馈照亮周边地面、栏杆与立柱）；
+   - 同时由眼周面部守卫压住正脸高光溢出，保证妆容与眼神通透。
+4. **防身体糊化红线（Anti-Body-Mush Guardrails）**：
+   - 严禁在人体肌肤/肢体上**先重度 `Multiply` 压暗、再连叠多层宽半径模糊 `Screen` / `Add` 雾罩**（会把肢体微反差与肌肤真实质感洗成一片灰紫泥团）；定向主受光优先改用保反差的中性灰 **`Soft Light`**（`opacity ~0.62–0.68`），保留黑位与肌肤原生纹理；
+   - `Depth-Anything-V2` 产生的 **Fresnel 边缘光必须严格用主体外轮廓距离场（`edge_dist`）门控在外边缘**，严禁因手臂/手掌/衣领的内部深度阶跃而在躯干或手指周围炸出一圈白雾晕；
+   - 服装/皮肤语义掩码在切入重打光前必须先补齐内部孔洞，防止黑色反光服饰漏出“奶牛灰斑”；前景大光斑特效（`04c` 等）需剔除落在暗色皮革或肢体内部的低频雾团，让高光与深黑褶皱保持刀切层次。
+
+> **开源选型边界说明**：调研对比过 `compphoto/Intrinsic`（高分本征反射/阴影分解）与 `GhostCai/PortraitRelighting`（Apache-2.0 NeRF 人像重打光），因两者均会重算或重绘原始人物皮肤纹理像素、违反本工作台 **Pure-PC 零人物 AI 重绘** 铁律，工作台保留 Apache-2.0 `Depth-Anything-V2-Small` 仅作 2.5D 法线提取，结合上述确定性数学重打光管线实现零损耗落地。

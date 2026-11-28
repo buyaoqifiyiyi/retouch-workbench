@@ -11,7 +11,7 @@ description: 基于开源引擎 PhotoCraft + LightCraft（原生 MCP / CLI）及
 
 1. **人像零 AI 重绘 · 协同边界铁律（Pure-PC Person Retouch × AI Empty BG & Black-BG VFX）**：
    - **人物像素严禁 AI 重绘**：所有面部、五官、皮肤、妆容、发丝与服饰精修，必须 100% 使用本机 **LightCraft + PhotoCraft** 原生工具/画笔/液化/三频/D&B 与纯确定性数学算法完成（`retouch-ai.py skin-fs` / `makeup-paint` / `body-liquify` / `garment-retouch` / `hair-paint`）。本地神经模型**严格仅用于生成黑白选区蒙版、透明通道、去杂边光解算与关键点引导**（如 `face-parse` / `body-parse` / `cutout-refine`），绝不重绘或涂抹改变人物原生皮肤与材质像素。
-   - **外部 AI 生图（用户抽卡）仅限两类图层**：① 按 `scene-whitemodel` 输出的白模底图与提示词抽出的**严格无人高清空镜背景**；② 按纯粹黑底（`#000000`）提示词抽出的**复杂梦幻粒子/光斑/流光特效叠层**（回传后由 `vfx-overlay` 执行光学 Unmult 去黑底、人物后/前纵深拆层与脸眼片名区避让后以图层覆盖）。
+   - **外部 AI 生图（严格归用户抽卡 · 硬暂停门禁）**：① 按 `scene-whitemodel` + `handoff-pack` 输出的无人白模底图与提示词抽出的**严格无人高清空镜背景**；② 按纯粹黑底（`#000000`）提示词抽出的**复杂梦幻粒子/光斑/流光特效叠层**。**硬性边界：除非用户在当前明确指令“你帮我直接生成/抽卡”，严禁私自调用 `image-generator` 替用户生成背景或特效！**生成白模与 `HANDOFF_FOR_USER.md` 后必须硬暂停交给用户，详见 [人机协同与白模抽卡规范](references/human-ai-collaboration-guide.md)。
 2. **原图绝对只读**：绝不覆盖原图或用户已有交付文件。所有工程文件（`.pcraft` / `.psd`）、侧车输出与交付副本统一写入 `D:\ps\<项目子目录>\`。
 3. **接图必先验真**：开修前运行检查脚本核对文件头真实编码（防范 JPEG 改名 `.png`）、像素尺寸、位深、色彩配置与图层树：
    ```powershell
@@ -19,12 +19,13 @@ description: 基于开源引擎 PhotoCraft + LightCraft（原生 MCP / CLI）及
    ```
 4. **先修美颜底图与原生分辨率硬门禁（Beauty-First & Resolution Gate）**：人像正片、美颜精修或 COS 二次元厚涂前，必须严格按 `LightCraft 暖润安全底 → 骨相液化+重跑蒙版 → 瑕疵/超分黑线与眼区穿帮杂发清理 → 校准高低频与D&B → 3步奶油瓷白肌（全臂连续蒙版） → 自然非贴纸眼唇` 先产出并 **独立单张真 `1:1`（`<=512px`）** 验收 **`01_beauty_base.png` + `.pcraft`**，再对服装与下肢依次运行 **`garment-retouch --out-dark-mask`**（纯明度空间去雾+外缘半透明去白边，并把含鞋袜/兜底黑鞋的完整深色服装罩透传给 `harmonize --garment-dark-mask`）与 **`skin-unify`**（下肢褪色膝盖对齐手臂晴光肤色、左缘去白边并叠黑裙/交叠腿遮挡影），才允许继续换背景或合成。**防糊斑红线**：严禁在背景抠图前用 `LaMa` 大面积抹除主体轮廓旁的衣物飘带/发丝交界区（`LaMa` 会把前景与旧背景涂成不透明灰白糊斑并被 `BiRefNet` 锁进主体前景）；如需清理边缘杂物应先保留原物或在换背景后于独立非破坏层处理，复核可疑灰边时必须直接对照最原始输入图（`00_input`）。**原生分辨率门禁**：背景或大型贴片素材相对目标区域的线性原生比必须 `>= 0.6`；严禁把 `<= 1K` 生图盲目 `realesrgan 4x` 直接当成 4K 背景/发片使用，低清底图必须走 **`tile-split` → 分块高清精绘 → `tile-stitch`（低频锁光影 + 亚像素对齐）** 路线消除油画伪影。
 5. **按真实画风选头发路线 + 零间隙遮挡铁律（Style-Adaptive Hair Gate）**：
-   - **写实人像/实拍风 COS** 默认走 **`hair-comp --mode real-first --groom`** 保留 100% 原生 4K 高清真发（头部、刘海、胸前与跨手臂交界发丝），同时顺发流轻理顺外侧炸毛并回暖漂白发白斑；需要增加飘逸毛流感时，走 **[分层画发丝指南](references/hair-painting-guide.md)** + **`hair-paint`（PhotoCraft 原生极细双端渐细单丝束）** 在原发上拆成 **后景组（`02b_HAIR_PAINT_BEHIND_4K`）+ 前景组（`03b_HAIR_PAINT_FRONT_4K`：`Normal` 飘丝 + `Linear Dodge (Add)` 逆光飞丝）** 非破坏叠加（按起笔局部自吸真发色、严格扩张避开眼区与面部、并与 `0px` 零扩边前景遮挡互不干扰）；**严禁用低清超分油画假发片、平宽扁色带笔刷或 `PIL` 生硬直线划伤实拍质感**；
-   - 如确需大范围飘发重塑或二次元厚涂，走 `hybrid-flow` / `full-replace`，必须以引导滤波对齐真实紧贴遮挡物（`0px` 外扩遮罩，`0.8px` 抗锯齿），严禁糊状扩边把跨臂/跨腕发丝切断或在外围留半透明灰白残影条。
+   - **写实人像/实拍风 COS 轻量保原形**走 **`hair-comp --mode real-first --groom`**（结构张量切向轻量理顺外侧炸毛、保留 `82%` 原生微发丝并回暖漂白发斑）；需要轻量补充空气毛流感走 **`hair-paint`**（PhotoCraft 原生渐细单丝束 `02b_HAIR_PAINT_BEHIND_4K` + `03b_HAIR_PAINT_FRONT_4K`）。
+   - **兼顾真实“一根一根”1:1 发丝质感与动漫整头融合美学（推荐）**直接走 **[头发后期指南](references/hair-painting-guide.md)** + **`hair-sculpt --engine anime-sculpt`（默认 v11 · 全头无折叠 `Rigid MLS` 微托冠 + 亚像素解析逐丝微簇聚散引擎 + 发根锚定实拍采样色 + 外部镂空散光包裹与自然 `85mm` 景深）**，彻底取消生硬宽塑料带，改为 `0.8–2.2px` 独立微丝按“2–3 股有聚有散小撮 + 斜向真透气缝隙 + 长短错落丝梢 + 高密交叠细丝中轴”构造（保留 `--engine tutorial-rake` 与 `--engine blender` 作可选回退）；按发型（`long-cascade` / `twintails` / `short-braids-wispy`）输出深埋发根、避让腕饰/衣领纯白反光/黑裙的零侵入分层 `.pcraft`；**严禁用整块宽色带（一坨/塑料管）、等距平行梳齿线（蜘蛛网/面条）、点状锯齿描边或非预乘白边破坏实拍质感**；
+   - 无论哪种路线，必须保留原图真实五官、眼区 `0px` 零侵入，并以引导滤波对齐紧贴遮挡物，严禁糊状扩边把跨臂/跨腕发丝切断或在深色衣装留下灰雾。
 6. **关键修改前必留快照**：PhotoCraft 的 `command_batch` **不是原子事务**（中途失败时已完成的前序步骤会保留，不会自动回滚）。每轮批量修改前先调用 `history.newSnapshot` 留底；失败或跑偏时用 `history.selectSnapshot` 或 `edit.undo` 回退。
 7. **真 `1:1` 独立单切图 + 自动掩码体检 + 真实看图铁律**：
    - 整图光影与大形：`doc_render_preview`（最大边 2048）。
-   - **严禁把多张放大细节缩拼进一张千像素拼图当作 `1:1` 验收**，更**严禁未亲眼看到图片画面就声称视觉通过（`--visual-reviewed` 仅在确实看图审阅后才能启用，否则 `verdict` 停在 `NUMERIC_PASS_VISUAL_UNVERIFIED`）**。导出前必跑 **`retouch-ai.py mask-audit`**（零破洞、零半透明残影、手臂遮挡零断口、中性黑衣零偏棕、织纹留存、人景融合、热点 `1:1` 切片），并逐张审阅 `<=512px` 独立 `1:1` 切片 + `retouch-ai.py qa`。
+   - **严禁把多张放大细节缩拼进一张千像素拼图当作 `1:1` 验收**，更**严禁未亲眼看到图片画面就声称视觉通过（`--visual-reviewed` 仅在确实看图审阅后才能启用，否则 `verdict` 停在 `NUMERIC_PASS_VISUAL_UNVERIFIED`）**。**严禁只盯脸部漏审身体**：每次验收必须按**全身四区**（① 面部眼唇与手腕/发际交界、② 躯干手臂与手指肤色清晰度、③ 胯部深色服饰内腔与接触边缘、④ 下肢靴鞋与前景特效交界）逐区审阅 `<=512px` 独立 `1:1` 切片 + `retouch-ai.py qa`。导出前必跑 **`retouch-ai.py mask-audit`**（零破洞、零半透明残影、手臂遮挡零断口、中性黑衣零偏棕、织纹与全身皮肤微反差留存、`mask_sanity_check` 零溢出与未认领蜂窝洞、人景融合、热点 `1:1` 切片；传入 `--skin-mask` 及可选 `--face-skin-mask`）。
    - 严禁把“命令返回成功”“建了空白修复层/中性灰层/分频组”或“仅靠数值达标而没真修好视觉瑕疵”说成修图完成。
 8. **先存可编辑工程，再导出发布副本**：先通过 `doc_save` 保存可编辑 `.pcraft` / `.psd`，再视交付要求用 `edit.convertToProfile` 转换目标配置（如 `srgb`）并导出 JPEG/PNG，导出后重开复核尺寸、图层与观感。
 
@@ -48,19 +49,22 @@ description: 基于开源引擎 PhotoCraft + LightCraft（原生 MCP / CLI）及
 | `face-parse` | `uniface` RetinaFace + 106 关键点 + BiSeNet 19 类（CUDA） | 产出 `faces.json`（含 `landmarks_106` 与眼眉/唇 `liquify_freeze_polygons`）+ 严格互斥蒙版 `mask_skin.png` / `mask_eyes_brows.png` / `mask_lips.png` / `mask_hair_head.png` |
 | `matte` / `cutout-refine` | `BiRefNet_lite` + **高分边界分块重构 + 无依赖多层 F/B 光学前景解算 + 发丝断口桥接** | `cutout-refine` 专门根治高倍缩放导致细发丝啃食断口与深灰/紫边溢色，产出纯净直通 RGB + 连续发丝透明遮罩及黑白底校验图 |
 | `skin-fs` | OpenCV Contrib `rollingGuidanceFilter` CIE Lab 双尺度三频 + MediaPipe 478 点 + PhotoCraft D&B | 纯手修非生成：低频匀影、中频去斑、高频 100% 锁毛孔，全臂/颈/腿连贯肤色并自动生成 PhotoCraft 50% 灰柔光 `skin_db_neutral_softlight.png` |
-| `makeup-paint` | **MediaPipe 478 点 + PhotoCraft 原生 `paint.stroke` 压感手绘妆容** | 闭眼/睁眼自适应（闭眼自动关闭瞳孔高光），导出 5 张独立透明手绘层：睫毛眼线、卧蚕珍珠点睛、眸光、雾面腮红、水润唇釉 |
+| `makeup-paint` | **MediaPipe 478 点 + PhotoCraft 多混合模式（`Multiply`/`Soft Light`/`Color`/`Screen`）+ 原生 `Blend-If` 光学补妆引擎 v2** | 支持 `natural` / `editorial` / `cos-anime` / `painterly` 四档通用画风、闭眼自适应与原色保留，导出 9 层零贴纸光学妆层（泪沟鼻D&B/眼白/眼影深度与发色/虹膜上睑压影与折射/贴根眼线与真睫强化/腮红/PiXimperfect 三层护纹唇妆） |
 | `body-liquify` | **MediaPipe 33 骨骼 + 轮廓曲率袜口检测 + PhotoCraft `filter.liquify` 智能滤镜** | 冻住五官后自动压顺斜方肌、手臂、腰线及大腿袜口勒痕并输出可编辑 `.pcraft` 与照镜子对比图 |
-| `vfx-overlay` | **能量守恒 Adaptive Black-Floor + Optical Unmult 去黑底引擎** | 专接用户抽卡的黑底 AI 粒子/星芒/光斑：严格按 `a_behind + a_front <= alpha` 分拆“主体后/主体前”，配 `--density-gamma` / `--haze-suppress` / `--max-alpha` 抑制雾斑抢戏、`--subject-front-keep` 保护人物核心且零眼区/片名遮挡 |
-| `scene-whitemodel` | **Blender 5.x GPU 6 大场景白模工厂** | 一键出纯净白模（供用户 AI 抽空镜）+ 16-bit 物理 Z-Depth + `scene_meta.json`（真太阳方向）+ 双语背景/黑底特效抽卡提示词 |
+| `vfx-overlay` | **能量守恒 Unmult + 2.5D 法线因果重打光引擎** | 专接用户抽卡的黑底 AI 特效：`a_behind + a_front <= alpha` 前后拆层、`--density-gamma` / `--haze-suppress` 控雾；细肢体前景仅放行锐利细星点（拦截大虚化光斑糊脚踝），菲涅尔边缘光严格锁死外轮廓（零内部白雾）；接入 `--normal-map` / `--fg-rgba` / `--garment-mask` / `--bg` 自动算 **2.5D 因果漫射 (`Screen`) + 近距锐高光 (`Linear Dodge`) + 周边建筑环境溢光 (`Screen`)** 且零眼区/片名遮挡 |
+| `scene-whitemodel` | **Blender 5.x GPU 6 大场景白模工厂 + 自动出交接包** | 一键出纯净白模（供用户 AI 抽空镜）+ 16-bit 物理 Z-Depth + `scene_meta.json` + 自动触发 `handoff-pack` 产出交接卡片并锁定 `AWAITING_USER_ASSETS` |
+| `handoff-pack` | **白模抽卡与构图硬暂停交接打包器** | 输出可复制双语空镜/纯黑底特效提示词（`HANDOFF_FOR_USER.md`）、状态锁 `handoff_manifest.json`（禁止擅自自生成）与含支撑线/主光箭头的构图参考 `03_layout_and_light_guide.png` |
 | `body-parse` | 默认 **`SegFormer-B2 Clothes` 18 类 ONNX CUDA + 引导滤波**（MIT），回退支持 `MediaPipe`（`--backend`） | 精准拆分 `mask_hair` / `mask_upper_clothes` / `mask_skirt_dress` / `mask_shoes` / `mask_legs` / `mask_arms` 与受保护整体掩码 `mask_protected_body`，并产出 `preview_parse_overlay.png` |
-| `mask-audit` | 工程级掩码、**边缘完整度**、**光感区分服饰明暗阈值**与 **`cinema_tone_check`** 自动体检 | 检测破洞、残影、断发微粒、边缘色偏与画面影调黑位/反差（`p02_L` / `dyn_range`）；高调服饰（`p50 >= 120`）自动区分自然侧光梯度与黑衣断层，支持 `--scene-meta` 校验物理太阳光向 |
-| `hair-comp` | 自适应风格头发合成与零间隙遮挡（`SegFormer` + `BiRefNet` + CIE Lab） | 写实正片默认 `real-first` 保原生 4K 真发，支持 `--groom` 顺发流切向轻量理顺（仅驯服炸毛、保大形与刘海/眼周）；`hybrid-flow`/`full-replace` 支持零扩边紧贴遮挡与降油画频段匹配 |
-| `hair-paint` | PhotoCraft 原生极细单丝束前后分层画发（`brush.presets.importImage` + `paint.stroke` 方向压感） | 永不删原发、局部自吸真发根色融合深中浅调，输出后景柔流层 `hair_paint_01_soft_flow_behind.png` + 前景飘逸 `Normal` 层 + `Linear Dodge (Add)` 逆光飞丝毛流感层，带扩张脸/眼避让与 `0px` 零扩边前景遮挡擦除 |
+| `mask-audit` | 工程级掩码、**全身皮肤清晰度**、**参考比对高调/漆皮梯度**与 **`cinema_tone_check`** 自动体检 | 检测破洞、残影、断发微粒、边缘色偏、**全身皮肤微反差塌陷（`body_skin_clarity_check` 接入 `--skin-mask`/`--face-skin-mask`）**、**服饰溢出主 Alpha 与内部蜂窝破洞（`mask_sanity_check`）**及黑位动态跨度；支持 `--reference` 比对漆皮真实反光梯度防误杀，支持 `--scene-meta` 校验太阳光向 |
+| `hair-comp` | 自适应风格头发合成与切向防糊理顺（`SegFormer` + `BiRefNet` + 结构张量门控 + CIE Lab） | 写实正片 `real-first --groom` 保原生 4K 编发与真发丝高频微理顺；兼顾紧贴遮挡与防漂白发白斑 |
+| `hair-paint` | PhotoCraft 原生极细单丝束前后分层轻量飞丝（`brush.presets.importImage` + `paint.stroke` 方向压感） | 永不删原发、局部自吸真发色，输出后景顺流层 + 前景 `Normal` / `Linear Dodge (Add)` 毛流感层 |
+| `hair-sculpt` | **Whole-Head Analytical Strand Engine（默认 `--engine anime-sculpt` v11：无折叠 `Rigid MLS` 整头提廓 + `0.8–2.2px` 亚像素解析微簇发丝聚散 + 外部透空光晕包裹 × `85mm` 景深）**；可选回退 `tutorial-rake` / `blender` | 告别“一坨”硬塑料片与平行面条，以真正可数的一根一根微丝聚成兼顾发量实感与斜向透气的动漫飘发（`long-cascade`/`twintails`/`short-braids-wispy`），一键装配零扩边遮挡与安全避让的 `.pcraft` 分层堆栈 |
 | `garment-retouch` | `SegFormer` 语义分服 + CIE Lab 纯明度三频 + 浅色质感配方 | 新增 **`pastel-lace` / `translucent-organza` / `satin-ribbon` / `knit-stocking`** 纯物理配方，浅色衣装绝不误压暗，兼保黑衣不偏棕与 `--out-dark-mask` 透传 |
 | `skin-unify` | 下肢褪色炫光肤色对齐 + 外缘去白边 + 裙/腿物理遮挡影 | 以手臂晴光肤色为参考，用归一化卷积在不破坏皮肤纹理的前提下恢复下肢膝盖血色与反光压制，清掉左缘 cutout 白边并叠黑裙与交叠腿物理投影 |
 | `harmonize` | Apache-2.0 [`PhotoBlaze-PIH`](https://huggingface.co/JeremySD99/PhotoBlaze-PIH) ONNX CUDA（`curves.onnx` + `gain.onnx`） | 全分辨率 32 点调和曲线 + 空间光照增益 + 肤色与 `--garment-dark-mask` 全黑衣防回灰保护 + 双半径光学 `Light Wrap` + 颗粒匹配层 |
-| `relight-sculpt` | Apache-2.0 `Depth-Anything-V2-Small` ONNX 2.5D 法线重打光（**零人物像素重绘**） | 输出 4 张独立非破坏 PhotoCraft 剪贴层（背光体积暗面 `Multiply` / 迎光键光 `Screen` / 菲涅耳逆光包裹 `Screen` / 地面漫反射 `Soft Light`），重塑 4:1–6:1 体积光影 |
+| `relight-sculpt` | Apache-2.0 `Depth-Anything-V2-Small` 2.5D **去场馆平光 × 多光源场景解析重打光**（零像素重绘） | **去室内平光反光**（保高频毛孔、`relight_00`）+ 4 张方向重塑层 + **自动解析背景彩色霓虹/灯源（或 `--accent-light`）出漫射/高光/深黑护色 3 层**，并提供 PhotoCraft 原生装组与鼻斜坡法线保护 |
 | `cinema-grade` | Blender 5.2 `AgX` / 2383 标准 `.cube` 3D LUT + PhotoCraft 原生 `filter.cameraRaw` / `colorLookup`（`tetrahedral`） | `bg-anchor` 压实背景非光区黑位并产出近景暗框景深遮挡；`grade` 执行电影冷暖分色阶、四面体 3D LUT 与严格来自实景高光的微光晕 |
+| `output-sharpen` | **线性亮度 Richardson-Lucy 反卷积 + 非对称防白边 + 四级语义焦点蒙版**（纯本机零 AI 重绘） | 置于顶层颗粒正下方：只提眼瞳/唇线/发丝/衣料与前景结构锐度，严格避开奶油光滑肤质、扣像边缘环与远景散景 |
 | `fg-vfx-3d` | **Blender 5.x GPU 3D 物理前景散景 + 贴身流光音律丝带** | 用真实 `f/1.18` 大光圈渲染近景虚化铁艺/花叶/暖金折射晶滴（实体遮挡底边并拉出纵深），并产出“后穿前绕”贴身丝带及受 2.5D 法线调制的局部因果反光与拱门背光边缘光 |
 | `tile-split` / `tile-stitch` | 重叠分块与低频锁光影 + 亚像素 ECC 无缝拼合 | 把低分建筑/场景底片按 2×2 分块高清重绘后再按低频锁定回拼，突破 `0.6` 原生分辨率门禁 |
 | `inpaint` | `LaMa`（`big-lama.pt`，Apache-2.0）仅裁剪 Mask ROI 推理，**掩码外零改动** | 加 `--patch-only` 输出透明局部补丁 PNG，直接用 `doc_place` 叠进 PhotoCraft 当非破坏修复层 |
@@ -105,10 +109,12 @@ description: 基于开源引擎 PhotoCraft + LightCraft（原生 MCP / CLI）及
 | 场景 | 读取文件 |
 | --- | --- |
 | 场照（`field`）/ 正片（`formal`）标准流程、美颜前置门禁与常见翻车排查 | [工作流程](references/workflows.md) |
+| **人机协同分工、四道硬门禁、白模提示词打包与回图交接规范（必读防越权）** | [人机协同与交接规范](references/human-ai-collaboration-guide.md) |
 | **人像与 COS 骨相液化实操（五大原则、冻区、照镜子验收、重跑蒙版）** | [液化指南](references/liquify-guide.md) |
 | **商业自然精修与奶油瓷白肌调色（硬门禁、高低频校准、3 步不偏灰调色）** | [自然精修与奶油肌](references/natural-beauty-guide.md) |
+| **商用与 COS 光学补妆精修圣经（PiXimperfect 三层唇妆、`Blend-If` 护纹、真眼光学压影与 4 档画风）** | [光学补妆精修圣经](references/makeup-retouch-guide.md) |
 | **服饰分层精修与去雾保色（纯明度三频分离、防黑衣发棕、分材质配方与 `garment-retouch`）** | [服饰精修指南](references/garment-retouch-guide.md) |
-| **COS 分层画发丝实战（3 笔刷、7 步原发延展、`Linear Dodge (Add)` 飞丝毛流感与 `hair-paint`）** | [分层画发丝指南](references/hair-painting-guide.md) |
+| **COS 头发后期指南（真实发丝质感 × 大胆动漫飘逸感：`hair-sculpt` / `hair-paint` / `hair-comp` 完整工作流与避坑实证）** | [头发后期指南](references/hair-painting-guide.md) |
 | **COS 与人像专业合成与溶图（检查层、黑位、Blender 极简白模+Shadow Catcher、双轮生图接地、反曲线光与颗粒）** | [合成与溶图指南](references/compositing-guide.md) |
 | **调色、光影重塑与同层溶图（去泥巴黄、冷暖分离、4:1 重打光与锐度匹配）** | [调色与光影指南](references/color-lighting-guide.md) |
 | 二次元厚涂 COS（反贴纸眼唇、藏色发束与 PhotoCraft+强图模+锁罩回贴 SOP） | [厚涂方法卡](references/painterly-methods.md) |

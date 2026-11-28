@@ -94,13 +94,13 @@ def _hi_res_boundary_tiles(
     stride: int = 1360,
 ) -> tuple[np.ndarray, int]:
     """Run BiRefNet-lite on 1664px context boundary windows to recover thin hair & lace silhouette continuity."""
-    import onnxruntime as ort  # type: ignore
+    from cuda_env import create_onnx_session
 
     h, w = alpha_coarse.shape[:2]
     if max(h, w) <= int(tile_size * 1.15):
         return alpha_coarse.copy(), 0
 
-    sess = ort.InferenceSession(str(birefnet_model), providers=["CPUExecutionProvider"])
+    sess = create_onnx_session(birefnet_model)
 
     # Perimeter unknown band + hair outline band (keeps solid interior & far background untouched)
     soft_band = (alpha_coarse > 0.015) & (alpha_coarse < 0.985)
@@ -272,9 +272,9 @@ def run_cutout_refine(
     if coarse_mask_path is not None and coarse_mask_path.exists():
         alpha_coarse = _read_gray_f32(coarse_mask_path.resolve(), (w, h))
     else:
-        import onnxruntime as ort  # type: ignore
+        from cuda_env import create_onnx_session
 
-        sess = ort.InferenceSession(str(birefnet_model_path), providers=["CPUExecutionProvider"])
+        sess = create_onnx_session(birefnet_model_path)
         alpha_coarse = _run_birefnet_array(sess, rgb_u8)
 
     hair_mask = None

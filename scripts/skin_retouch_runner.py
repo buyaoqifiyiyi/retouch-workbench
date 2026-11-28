@@ -111,9 +111,9 @@ def run_skin_retouch(
     overwrite: bool = False,
     out_skin_mask: Path | None = None,
 ) -> dict[str, Any]:
-    import onnxruntime as ort
     import torch
     import torch.nn.functional as F
+    from cuda_env import create_onnx_session
     from uniface import RetinaFace, set_cache_dir  # type: ignore
 
     from skin_retouching.detection_model.detection_unet_in import DetectionUNet
@@ -180,12 +180,7 @@ def run_skin_retouch(
 
     skin_mask_arr = None
     if whitening_degree > 0:
-        avail = ort.get_available_providers()
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if "CUDAExecutionProvider" in avail else ["CPUExecutionProvider"]
-        try:
-            sess = ort.InferenceSession(str(skin_onnx_path), providers=providers)
-        except Exception:
-            sess = ort.InferenceSession(str(skin_onnx_path), providers=["CPUExecutionProvider"])
+        sess = create_onnx_session(skin_onnx_path)
         rgb_small, _ = resize_on_long_side(rgb, 800)
         in_name = sess.get_inputs()[0].name
         out_name = sess.get_outputs()[0].name

@@ -11,7 +11,7 @@
 | 3. 光影塑形与双曲线 | 大范围体积与局部斑块明暗分开，明暗双曲线配合局部蒙版 | 两条 `layer.newAdjustmentLayer.curves` 或 `paint.dodge`/`paint.burn`；保护眼妆与五官转折 |
 | 4. 高低频（频率分离） | 先验证未编辑时重构还原度，低频匀色调、高频保纹理 | `image.applyImage` + `filter.blur.gaussianBlur` + `linearLight`；低频只从低频取样 |
 | 5. 液化塑形 | 前推、重建、冻结保护锚点；检查五官、衣纹与背景直线 | 复制转智能对象 → `filter.liquify`（`freeze`/`lassoMask`/`reconstruct`）；大形用 `edit.puppetWarp` |
-| 6. 电子补妆 | 眼线、睫毛、眼影色区、唇缝与高光独立层控制 | `layer.new.layer` + `paint.stroke` + `Color`/`Screen` 混合模式 |
+| 6. 电子补妆 | 遵循零贴纸五铁律、五官解剖与 4 档画风；PiXimperfect 三层护纹唇妆与上睑投影虹膜 | 详见 [光学补妆精修圣经](makeup-retouch-guide.md)；`retouch-ai.py makeup-paint` + `Multiply`/`Soft Light`/`Color`/`Screen` + `layer.layerStyle.blendingOptions`（`blendIf`） |
 | 7. 假发与补发丝 | 区分杂丝清理、断丝补接、大束概括与压感细丝 | `paint.mixerBrush` / `paint.smudge` + `path.stroke`（`simulatePressure: true`） |
 | 8. 抠图与边缘细化 | 主体选区、发丝边缘、颜色净化、深浅底对照检查 | `select.subject` → `select.refineEdge`（`decontaminate`）+ `paint.stroke(target:"mask")` |
 | 9. 服装修整 | 污点、浮线、非结构皱纹与局部材质连续 | 高低频低频修暗斑、`paint.cloneStamp`/`paint.patch`/`edit.contentAwareFill` |

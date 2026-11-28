@@ -306,12 +306,14 @@ def run_skin_fs(
         # Avoid white clothing bleeding into neck/chest mask_body_skin
         real_bskin = b_bskin * np.clip((chroma - 9.0) / 5.0, 0.0, 1.0) * np.clip((92.0 - L) / 6.0, 0.0, 1.0)
         skin_union = np.maximum.reduce([f_skin, b_arms, real_bskin, bare_legs])
-        hair_guard = np.maximum(hair_guard, b_hair)
+        # Never let coarse full-body SegFormer hair mask punch false holes inside high-res BiSeNet f_skin cheeks!
+        hair_guard = np.maximum(f_hair, b_hair * np.clip(1.0 - f_skin * 1.4, 0.0, 1.0))
         clothes_guard = b_clothes
 
     eyes_g = cv2.dilate((f_eyes > 0.12).astype(np.float32), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35)))
     lips_g = cv2.dilate((f_lips > 0.12).astype(np.float32), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19)))
-    hair_g = cv2.dilate((hair_guard > 0.35).astype(np.float32), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
+    hair_g_raw = cv2.dilate((hair_guard > 0.40).astype(np.float32), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+    hair_g = np.where(f_skin > 0.65, f_hair, hair_g_raw)
     clothes_g = cv2.dilate((clothes_guard > 0.42).astype(np.float32), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)))
 
     fg = _read_gray_f32(alpha_mask_path.resolve(), (w, h)) if alpha_mask_path and alpha_mask_path.exists() else np.ones((h, w), dtype=np.float32)
@@ -446,223 +448,41 @@ def run_makeup_paint(
     pc_exe: str,
     face_task_path: Path,
     faces_json_path: Path | None = None,
+    face_parse_dir: Path | None = None,
+    style: str = "natural",
     intensity: float = 0.72,
+    iris_color: str | None = None,
+    lip_tone: str | None = None,
+    eyeshadow_tone: str | None = None,
+    blush_tone: str | None = None,
+    lash_mode: str = "auto",
+    aegyo_sal: float | None = None,
+    skip_nose_db: bool = False,
+    build_pcraft: bool = False,
     overwrite: bool = False,
 ) -> dict[str, Any]:
-    """Pure PC PhotoCraft hand-painted makeup layers guided by 478 MediaPipe FaceLandmarker points."""
-    in_p = input_path.resolve()
-    out_d = out_dir.resolve()
-    out_d.mkdir(parents=True, exist_ok=True)
+    """Pure-PC PhotoCraft optical multi-blend makeup layers v2 (delegates to makeup_retouch_ops)."""
+    from makeup_retouch_ops import run_makeup_paint_v2
 
-    rgb_u8 = np.array(Image.open(in_p).convert("RGB"), dtype=np.uint8)
-    h, w = rgb_u8.shape[:2]
-    tips = ensure_studio_brush_tips()
-
-    pts = _detect_mediapipe_face478(rgb_u8, face_task_path, faces_json_path)
-    if pts is None:
-        raise RuntimeError(f"FaceLandmarker failed to detect a face in {in_p}")
-
-    # Compute left/right Eye Aspect Ratio to guard closed/downcast eyes from painted iris orbs
-    l_w = float(np.linalg.norm(pts[133] - pts[33]))
-    l_h = float(np.linalg.norm(pts[159] - pts[145]))
-    r_w = float(np.linalg.norm(pts[263] - pts[362]))
-    r_h = float(np.linalg.norm(pts[386] - pts[374]))
-    ear_l = l_h / max(1.0, l_w)
-    ear_r = r_h / max(1.0, r_w)
-    # Require clear open-eye vertical span >= 0.245 so downward/closed COS eyes never receive fake iris catchlights
-    eyes_open = (0.5 * (ear_l + ear_r)) >= 0.245
-    eye_span = float(np.linalg.norm(pts[263] - pts[33]))
-    k_i = float(np.clip(intensity, 0.1, 1.4))
-
-    def _p(idx: int, pr: float = 0.75) -> list[float]:
-        return [round(float(pts[idx][0]), 1), round(float(pts[idx][1]), 1), round(pr, 3)]
-
-    # 1. Eyeliner & tapered individual lash wisps along upper lashline
-    strokes_lashes: list[dict[str, Any]] = []
-    upper_l = [246, 161, 160, 159, 158, 157, 173]
-    upper_r = [398, 384, 385, 386, 387, 388, 466]
-    for arc, outer_dir in ((upper_l, (-1.0, -0.25)), (upper_r, (1.0, -0.25))):
-        pts_line = [_p(i, 0.25 + 0.70 * math.sin(math.pi * k / max(1, len(arc) - 1))) for k, i in enumerate(arc)]
-        strokes_lashes.append({
-            "tip": "retouch_02_micro_liner",
-            "points": pts_line,
-            "size": round(max(3.5, l_w * 0.055), 1),
-            "size_min": 0.25,
-            "color": "#1c1315",
-            "opacity": round(min(0.68, 0.52 * k_i), 3),
-            "flow": 0.72,
-            "spacing": 0.05,
-        })
-        # Delicate individual lash hairs sprouting naturally upward/outward from upper lid
-        for k, idx in enumerate(arc[1:]):
-            bx, by = float(pts[idx][0]), float(pts[idx][1])
-            t = k / max(1, len(arc) - 2)
-            dx_w = (t - 0.45) * 0.8 + outer_dir[0] * 0.25
-            dy_w = -0.85 if eyes_open else 0.35
-            mag = math.hypot(dx_w, dy_w) + 1e-5
-            ux, uy = dx_w / mag, dy_w / mag
-            llen = l_w * (0.11 + 0.06 * abs(t - 0.5))
-            l_pts = [
-                [round(bx, 1), round(by, 1), 0.85],
-                [round(bx + 0.55 * llen * ux, 1), round(by + 0.55 * llen * uy, 1), 0.55],
-                [round(bx + llen * ux, 1), round(by + llen * uy, 1), 0.08],
-            ]
-            strokes_lashes.append({
-                "tip": "hair_03_single_strand",
-                "points": l_pts,
-                "size": round(max(2.2, l_w * 0.032), 1),
-                "size_min": 0.08,
-                "follow_dir": True,
-                "color": "#231719",
-                "opacity": round(min(0.62, 0.46 * k_i), 3),
-                "flow": 0.78,
-                "spacing": 0.035,
-            })
-
-    # 2. Aegyo-sal shimmer & natural pearl/gem highlights strictly on bright existing under-eye highlights
-    strokes_aegyo: list[dict[str, Any]] = []
-    gray_luma = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2GRAY)
-    for lower_idx, off_y in (([7, 163, 144, 145, 153], 0.14 * l_w), ([381, 380, 374, 373, 390], 0.14 * r_w)):
-        shimmer_pts = [[round(float(pts[i][0]), 1), round(float(pts[i][1] + off_y * 0.55), 1), 0.65] for i in lower_idx]
-        strokes_aegyo.append({
-            "tip": "makeup_01_soft_airbrush",
-            "points": shimmer_pts,
-            "size": round(max(8.0, l_w * 0.14), 1),
-            "size_min": 0.45,
-            "color": "#fff5ec",
-            "opacity": round(min(0.40, 0.28 * k_i), 3),
-            "flow": 0.55,
-            "spacing": 0.10,
-        })
-        # Find crisp pinpoint pearl/gem specular peaks strictly brighter than surrounding skin (+30 luma)
-        cx = int(round(float(pts[lower_idx[2]][0])))
-        cy = int(round(float(pts[lower_idx[2]][1] + off_y * 0.75)))
-        rx, ry = int(max(12, l_w * 0.50)), int(max(10, l_w * 0.30))
-        x0, x1 = max(0, cx - rx), min(w, cx + rx)
-        y0, y1 = max(0, cy - ry), min(h, cy + ry)
-        if x1 > x0 and y1 > y0:
-            roi = gray_luma[y0:y1, x0:x1].astype(np.float32)
-            med_roi = float(np.median(roi))
-            for _ in range(2):
-                _, mv, _, ml = cv2.minMaxLoc(roi)
-                if mv >= max(205.0, med_roi + 35.0):
-                    gx, gy = x0 + ml[0], y0 + ml[1]
-                    strokes_aegyo.append({
-                        "tip": "makeup_05_pearl_star",
-                        "points": [[float(gx), float(gy), 0.90], [float(gx + 0.4), float(gy + 0.4), 0.90]],
-                        "size": round(max(4.0, l_w * 0.048), 1),
-                        "size_min": 0.6,
-                        "color": "#ffffff",
-                        "opacity": round(min(0.45, 0.34 * k_i), 3),
-                        "flow": 0.80,
-                        "spacing": 0.20,
-                    })
-                    cv2.circle(roi, ml, int(max(4, l_w * 0.12)), 0.0, -1)
-
-    # 3. Iris radiance & catchlights ONLY when eyes are actually open (EAR >= 0.16)
-    strokes_iris: list[dict[str, Any]] = []
-    if eyes_open and len(pts) >= 478:
-        for iris_idx in (468, 473):
-            ix, iy = float(pts[iris_idx][0]), float(pts[iris_idx][1])
-            strokes_iris.append({
-                "tip": "makeup_05_pearl_star",
-                "points": [[round(ix - l_w * 0.08, 1), round(iy - l_w * 0.06, 1), 0.95]],
-                "size": round(max(5.0, l_w * 0.08), 1),
-                "size_min": 0.7,
-                "color": "#ffffff",
-                "opacity": round(min(0.75, 0.58 * k_i), 3),
-                "flow": 0.90,
-                "spacing": 0.25,
-            })
-
-    # 4. Pastel peach-rose blush cloud on outer cheek apples + tiny nose-tip touch
-    strokes_blush: list[dict[str, Any]] = []
-    for c_indices in ((116, 123, 50), (345, 352, 280)):
-        c_pts = [[round(float(pts[i][0]), 1), round(float(pts[i][1]), 1), 0.65] for i in c_indices]
-        strokes_blush.append({
-            "tip": "makeup_03_blush_cloud",
-            "points": c_pts,
-            "size": round(eye_span * 0.44, 1),
-            "size_min": 0.45,
-            "color": "#f49896",
-            "opacity": round(min(0.28, 0.19 * k_i), 3),
-            "flow": 0.45,
-            "spacing": 0.14,
-        })
-    strokes_blush.append({
-        "tip": "makeup_01_soft_airbrush",
-        "points": [_p(4, 0.6), _p(1, 0.45)],
-        "size": round(eye_span * 0.16, 1),
-        "size_min": 0.4,
-        "color": "#f59d98",
-        "opacity": round(min(0.18, 0.12 * k_i), 3),
-        "flow": 0.40,
-        "spacing": 0.12,
-    })
-
-    # 5. Coral-rose lip glaze tint + crisp liquid gloss highlight on lower lip belly
-    strokes_lips: list[dict[str, Any]] = []
-    inner_lip = [78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308]
-    strokes_lips.append({
-        "tip": "makeup_01_soft_airbrush",
-        "points": [_p(i, 0.65) for i in inner_lip],
-        "size": round(eye_span * 0.14, 1),
-        "size_min": 0.45,
-        "color": "#e86e68",
-        "opacity": round(min(0.32, 0.24 * k_i), 3),
-        "flow": 0.55,
-        "spacing": 0.08,
-    })
-    gloss_arc = [84, 17, 314]
-    strokes_lips.append({
-        "tip": "makeup_04_gloss_specular",
-        "points": [[round(float(pts[i][0]), 1), round(float(0.55 * pts[i][1] + 0.45 * pts[14][1]), 1), 0.78] for i in gloss_arc],
-        "size": round(eye_span * 0.11, 1),
-        "size_min": 0.45,
-        "color": "#fff8f6",
-        "opacity": round(min(0.45, 0.34 * k_i), 3),
-        "flow": 0.65,
-        "spacing": 0.12,
-    })
-
-    layer_defs = [
-        ("makeup_01_eyeliner_lashes.png", strokes_lashes),
-        ("makeup_02_aegyosal_pearls.png", strokes_aegyo),
-        ("makeup_03_iris_catchlight.png", strokes_iris),
-        ("makeup_04_blush_contour.png", strokes_blush),
-        ("makeup_05_lips_gloss.png", strokes_lips),
-    ]
-    outputs: dict[str, str] = {}
-    comp = rgb_u8.astype(np.float32)
-    for fn, st in layer_defs:
-        out_p = out_d / fn
-        _render_pc_strokes_multi(
-            pc_exe=pc_exe,
-            width=w,
-            height=h,
-            brush_tips=tips,
-            strokes=st,
-            out_png=out_p,
-            tmp_pcraft=out_d / f"_tmp_{fn}.pcraft",
-        )
-        outputs[fn[:-4]] = str(out_p)
-        ov = np.array(Image.open(out_p).convert("RGBA"), dtype=np.float32)
-        a_ov = ov[:, :, 3:4] / 255.0
-        comp = np.clip(comp * (1.0 - a_ov) + ov[:, :, :3] * a_ov, 0.0, 255.0)
-
-    p_prev = out_d / "makeup_preview.png"
-    _write_png_u8(p_prev, comp, "RGB", overwrite=overwrite)
-    outputs["makeup_preview"] = str(p_prev)
-    meta = {
-        "ok": True,
-        "input": str(in_p),
-        "eyes_open": eyes_open,
-        "ear_avg": round(0.5 * (ear_l + ear_r), 3),
-        "eye_span_px": round(eye_span, 1),
-        "outputs": outputs,
-    }
-    (out_d / "makeup_meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
-    return meta
+    return run_makeup_paint_v2(
+        input_path=input_path,
+        out_dir=out_dir,
+        pc_exe=pc_exe,
+        face_task_path=face_task_path,
+        faces_json_path=faces_json_path,
+        face_parse_dir=face_parse_dir,
+        style=style,
+        intensity=intensity,
+        iris_color=iris_color,
+        lip_tone=lip_tone,
+        eyeshadow_tone=eyeshadow_tone,
+        blush_tone=blush_tone,
+        lash_mode=lash_mode,
+        aegyo_sal=aegyo_sal,
+        skip_nose_db=skip_nose_db,
+        build_pcraft=build_pcraft,
+        overwrite=overwrite,
+    )
 
 
 def run_body_liquify(

@@ -2,7 +2,7 @@
 
 面向 COS 正片场景合成、跨背景溶图、水面倒影置换与光效氛围整合。核心目标：**彻底消灭“人物像贴纸 P 在背景上”的割裂感，让透视、边缘、黑白位、三层阴影、光影包裹、物理景深与传感器颗粒长在同一张底片里。**
 
-> **前置硬门禁（Beauty-First Gate）**：开合之前必须先完成阶段一人物底图（`01_beauty_base.png` + `.pcraft`），确保骨相液化、肤色统一与眼唇细节已过 `1:1` 验收。当前工作流以 **LightCraft + PhotoCraft + Core 侧车（`BiRefNet_lite` / `uniface` / `MediaPipe` / `LaMa` / `Real-ESRGAN`）+ 内置图片模型按需生成场景/前景/特效素材** 为主力，所有素材最终回到 PhotoCraft 做分层精合与 4K 锁罩封装。
+> **前置硬门禁（Beauty-First & Handoff Gate）**：开合之前必须先完成阶段一人物底图（`01_beauty_base.png` + `.pcraft`），确保骨相液化、肤色统一与眼唇妆容已过 `1:1` 验收。人物像素全程 100% 本机 LightCraft + PhotoCraft + 确定性数学/蒙版精修；**背景空镜与纯黑底特效默认严禁私自调用内置生图越权代抽，须严格遵循 [人机协同与白模交接规范](human-ai-collaboration-guide.md) 先停下向用户交付白模与双语提示词**（仅当用户明确要求本机代生时才按权限调用）。所有素材最终回到 PhotoCraft 做分层精合与 4K 锁罩封装。
 
 ---
 
@@ -16,7 +16,7 @@
 2. **焦段与畸变匹配**：
    - 广角（≤28mm）空间透视强烈、近大远小明显；中长焦（85mm–135mm）背景压缩感强、轮廓平直。主体和背景焦段冲突时，优先更换素材或对局部建筑/道具做轻量透视校正。
 3. **主光方向与软硬质预判**：
-   - 明确背景主光源方位（左前/右后/顶光/漫射阴天）与光质（硬太阳光出锐影，大阴天或雾景出宽柔漫影），确保人物主受光侧与背景主光一致；不匹配的背景直接换底或用内置图片模型重绘适配光向。
+   - 明确背景主光源方位（左前/右后/顶光/漫射阴天）与光质（硬太阳光出锐影，大阴天或雾景出宽柔漫影），确保人物主受光侧与背景主光一致；不匹配的背景优先更换或重新由用户按白模抽卡适配光向。
 
 **PhotoCraft 常用命令**：
 - 置入与比例定位：`doc_place`、`edit.transform`
@@ -117,10 +117,10 @@
 1. **Blender 只做极简 3D 白模与人物立牌 `Shadow Catcher`（5 分钟定死物理规律）**：
    - 不做高耗时的细枝末节建模和材质雕刻，只输出 4 项硬约束：极简白模透视骨架、16-bit Z 深度图（给 PhotoCraft `lensBlur` 用）、太阳光导板，以及用 `scripts\blender-shadow-catcher.py` 将 `02_subject_cutout.png` 按站立鞋跟/前掌点立进 3D 地面渲染出的**同光向真投影层（`Multiply`）**与**地板微倒影层**；
    - 若原图场照本身就在脚下拍出了清晰同向太阳投影，也可按 PiXimperfect Real Shadows 思路直接提取原片真实脚影作为叠加参照。
-2. **高分辨率实拍背景（内置分块精绘 或 用户协同抽卡）与 Apache-2.0 PhotoBlaze-PIH ONNX 溶图调和**：
+2. **高分辨率空镜背景（用户白模协同抽卡 或 明确授权下分块精绘）与 PhotoBlaze-PIH ONNX 溶图调和**：
    - **两条合规高分路径（均须满足 `linear_ratio >= 0.6`，严禁低清 `<=1K` 图盲目 `realesrgan 4x` 直接充当 4K 背景）**：
-     - **A. 本机/自动分块路线**：走 **`retouch-ai.py tile-split` → 2×2 重叠高清重绘 / `tile-refine` → `tile-stitch`（低频锁光影 + 亚像素对齐）**；
-     - **B. Blender 白模协同抽卡路线（推荐）**：将 `01_blender_4k_beauty.png`（定死 85mm 透视、视平线与左→右日光向）交给用户，在外部高清图模（如 **Seedream 5.5** 等，直出短边 `>= 1440px` 真机实拍空镜，严禁加人物与前景大特效）按审美抽卡，再比例缩放回 4K、按新地面实测亮暗阴影配比校准 Blender 投影，所有特效留到 PhotoCraft 内分层穿插。
+     - **A. 用户白模协同抽卡路线（默认首选，见 [人机协同规范](human-ai-collaboration-guide.md)）**：运行 `scene-whitemodel` + **`handoff-pack`** 产出严格无人的 `01_blender_whitemodel_empty.png`、构图光向参考与 `HANDOFF_FOR_USER.md` 提示词卡后**硬暂停交由用户抽卡**，回传高清空镜后再做接触面对齐与投影校准；
+     - **B. 明确授权下的本机分块重绘路线**：仅在用户明确授权代生成/局改时，走 **`retouch-ai.py tile-split` → 2×2 重叠高清重绘 / `tile-refine` → `tile-stitch`**。
    - 溶图阶段优先运行 **`retouch-ai.py harmonize --garment-dark-mask <完整深色保护罩>`**（Apache-2.0 `PhotoBlaze-PIH` ONNX CUDA 32 点调和曲线 + 空间光照增益 + 肤色与**包含后踢鞋/黑袜在内的完整黑衣防回灰保护** + 双半径 `Light Wrap` + 颗粒匹配层），再用 PhotoCraft 反曲线与三层阴影微调收束。
    - 对独立 `01_beauty_base` 中的服饰与下肢务必依次走 **`retouch-ai.py garment-retouch --out-dark-mask`**（仅在 CIE Lab 明度 `L*` 去眩光并做纯半透 `alpha` 去白边）与 **`retouch-ai.py skin-unify`**（以手臂晴光肤色统一褪色膝盖、并叠加黑裙与上方交叠腿物理遮挡影）；**墙面/天空方向性 `Screen` 反弹光层必须排除已压暗的下肢膝盖阴影区**，防止把刚立住的裙下遮挡重新抬亮冲灰。
    - 对实拍发丝增加飘逸毛流感时，跑 **`hair-comp --mode real-first --groom`** 与 **`hair-paint`**，按 **后景柔流层（位于主体与黑腰带背面）→ 主体人物组 → 前景极细单丝/Add 飞丝组** 非破坏装配，避免腰带被粗暴截断或前景出现扁平带状笔触。
@@ -159,8 +159,8 @@
 3. **Special 8 混合模式的 `fillOpacity` 法则（防发光死白爆掉）**：
    - 在 `Linear Dodge (Add)`、`Color Dodge` 等 8 个特殊混合模式中，降低普通 `opacity` 容易发灰发闷；通过 **`layer.layerStyle.blendingOptions`** 降低 **`fillOpacity`**（配合 `transparencyShapesLayer: false`）会直接缩放发光数学叠加强度，**既压住中心不过曝成死白块，又能保留高饱和迷人色晕**。
    - 配合 **`layer.layerStyle.outerGlow` / `innerGlow`** 时，把 `fillOpacity` 设为 `0` 可单独保留纯程序光晕。
-4. **反向溢光染色（Spill Light —— 决定特效真伪的分水岭）**：
-   - 发光武器、手心法阵、萤火或水波光效**一定会照亮邻近物体**。必须在人物手掌、衣袖、胸前发丝与脸颊受光面建立剪贴层（反曲线或低 `fillOpacity` 的 `linearDodge`），用对应光色补足局部溢光与高光反射。
+4. **2.5D 法线驱动的特效因果溢光染色（Causal Spill Light —— 决定特效真伪的分水岭）**：
+   - 发光特效/霓虹/流光/火光**一定会照亮邻近肢体、衣褶与周边场景表面**。现在无需手工盲涂：运行 **`retouch-ai.py vfx-overlay --normal-map <2.5D法线图> --fg-rgba <主体> --garment-mask <黑衣罩> --bg <背景>`**，侧车会基于特效三尺度能量场梯度点乘 2.5D 法线自动产出三层因果光效：① 主体局部漫反射 `vfx_causal_broad_spill_screen.png`（`Screen`）、② 近距锐高光轮廓 `vfx_causal_hot_rim_add.png`（`Linear Dodge (Add)` 配 `fillOpacity 40–50`）与 ③ 落回背景地面/建筑的 `vfx_causal_env_spill_screen.png`，并自动保护双眸妆容不被荧光雾遮盖。
 
 ---
 

@@ -127,24 +127,23 @@ def decontaminate_fringe(
     if not eroded.any():
         return rgb_f32.copy()
 
+    filled = eroded.copy()
     num = np.zeros_like(rgb_f32, dtype=np.float32)
     den = np.zeros((h, w), dtype=np.float32)
     num[eroded] = rgb_f32[eroded]
     den[eroded] = 1.0
     extrap = rgb_f32.copy()
 
-    for idx, sig in enumerate(sigmas):
+    for sig in sigmas:
         b_num = cv2.GaussianBlur(num, (0, 0), sigmaX=sig)
         b_den = cv2.GaussianBlur(den, (0, 0), sigmaX=sig)
-        fill = b_num / np.maximum(b_den[:, :, None], 1e-5)
-        if idx == 0:
-            valid_f = b_den > 0.05
-            extrap[valid_f] = fill[valid_f]
-        else:
-            miss = den < 0.05
-            extrap[miss] = fill[miss]
-            den[miss] = np.maximum(den[miss], 0.02)
-            num[miss] = fill[miss] * den[miss, None]
+        valid = (~filled) & (b_den > 1e-3)
+        if valid.any():
+            fill = b_num[valid] / b_den[valid, None]
+            extrap[valid] = fill
+            filled[valid] = True
+            den[valid] = np.maximum(den[valid], 0.05)
+            num[valid] = fill * den[valid, None]
 
     fw = np.clip(fringe_weight, 0.0, 1.0)[:, :, None]
     return np.clip(rgb_f32 * (1.0 - fw) + extrap * fw, 0.0, 255.0)
@@ -389,15 +388,23 @@ def run_hair_comp(
                         acc_rgb += s_rgb * w_pix[:, :, None]
                         acc_w += w_pix
                 groomed = acc_rgb / np.maximum(acc_w[:, :, None], 1e-4)
+                # Preserve >=82% high-frequency micro-strands and protect braided cross-hatch zones from putty-smear
+                coherence = np.hypot(jxx - jyy, 2.0 * jxy) / np.maximum(jxx + jyy, 1e-6)
+                coh_gate = np.clip((coherence - 0.18) / 0.42, 0.15, 1.0)
+                y_orig = luma255(out_rgb)
+                y_groom = luma255(groomed)
+                hf_keep = (y_orig - cv2.GaussianBlur(y_orig, (0, 0), 1.5)) - (y_groom - cv2.GaussianBlur(y_groom, (0, 0), 1.5))
+                groomed_hf = np.clip(groomed + 0.82 * hf_keep[:, :, None], 0.0, 255.0)
                 d_prot = cv2.distanceTransform((prot_snap < 0.35).astype(np.uint8), cv2.DIST_L2, 5)
                 gs = float(np.clip(groom_strength, 0.0, 0.85))
                 gw = (
                     gs
+                    * coh_gate
                     * (0.15 + 0.85 * np.clip((d_prot - 6.0) / 28.0, 0.0, 1.0))
                     * cv2.GaussianBlur(valid_hair_f, (0, 0), sigmaX=1.2)
                     * groom_mask.astype(np.float32)
                 )[:, :, None]
-                out_rgb = np.clip(out_rgb * (1.0 - gw) + groomed * gw, 0.0, 255.0)
+                out_rgb = np.clip(out_rgb * (1.0 - gw) + groomed_hf * gw, 0.0, 255.0)
 
         hair_union = np.clip(hair_m * out_alpha * (1.0 - occ_tight), 0.0, 1.0)
     else:
@@ -1134,10 +1141,7 @@ def run_harmonize(
             raise FileNotFoundError(
                 f"PIH ONNX weights missing: {pih_curves_path} / {pih_gain_path}. Run download_models.py core."
             )
-        import onnxruntime as ort  # type: ignore
-
-        avail = ort.get_available_providers()
-        providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in avail] or ["CPUExecutionProvider"]
+        from cuda_env import create_onnx_session
 
         fg512 = cv2.resize(fg01, (512, 512), interpolation=cv2.INTER_AREA)
         bg512 = cv2.resize(bg01, (512, 512), interpolation=cv2.INTER_AREA)
@@ -1148,7 +1152,7 @@ def run_harmonize(
         t_bg = np.transpose(bg512, (2, 0, 1))[None, ...]
         t_m = m512[None, None, ...]
 
-        sess_c = ort.InferenceSession(str(pih_curves_path), providers=providers)
+        sess_c = create_onnx_session(pih_curves_path)
         provider_used = sess_c.get_providers()[0] if sess_c.get_providers() else "unknown"
         curves = np.asarray(
             sess_c.run(None, {"inputs": np.concatenate([t_comp, t_bg, t_m], axis=1).astype(np.float32)})[0],
@@ -1160,7 +1164,7 @@ def run_harmonize(
         inter512 = curved512 * m512[:, :, None] + bg512 * (1.0 - m512[:, :, None])
         t_inter = np.transpose(inter512, (2, 0, 1))[None, ...]
 
-        sess_g = ort.InferenceSession(str(pih_gain_path), providers=providers)
+        sess_g = create_onnx_session(pih_gain_path)
         gain512 = np.asarray(
             sess_g.run(None, {"inputs": np.concatenate([t_comp, t_bg, t_m, t_inter], axis=1).astype(np.float32)})[0],
             dtype=np.float32,
